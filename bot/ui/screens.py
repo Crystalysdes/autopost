@@ -200,7 +200,7 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
     lines = [f"<b>{type_icon} {t.esc(chat.title)}</b>", subtitle, f"ID: <code>{chat.tg_id}</code>", ""]
 
     if chat.status == "pending":
-        lines.append("⏳ <b>Бота добавил не владелец.</b> Примите чат, чтобы публиковать в нём, или выйдите из него.")
+        lines.append("⏳ <b>Бота добавил не админ.</b> Примите чат, чтобы публиковать в нём, или выйдите из него.")
     elif chat.status == "left":
         lines.append(
             "🚫 <b>Бота нет в этом чате</b> — его удалили или лишили прав. "

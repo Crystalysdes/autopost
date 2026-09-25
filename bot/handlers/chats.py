@@ -29,10 +29,10 @@ async def _gone(callback: CallbackQuery, app: App, callback_answer: CallbackAnsw
 
 @router.message(F.chat_shared)
 async def on_chat_shared(message: Message, app: App) -> None:
-    """Владелец выбрал чат кнопкой «➕ Добавить…» внизу экрана."""
+    """Админ выбрал чат кнопкой «➕ Добавить…» внизу экрана."""
     shared = message.chat_shared
     try:
-        change = await chat_service.fetch_and_apply(app, shared.chat_id, actor_id=app.owner_id)
+        change = await chat_service.fetch_and_apply(app, shared.chat_id, actor_id=message.from_user.id)
     except TelegramAPIError:
         await message.answer(
             "⚠️ Не получилось подключиться к этому чату. Скорее всего, у вас нет права назначать "

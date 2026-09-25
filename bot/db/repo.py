@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,15 +69,15 @@ class Claim:
     decision: ClaimDecision
 
 
-def next_chat_status(prev: str | None, in_chat: bool, actor_id: int | None, owner_id: int) -> str:
+def next_chat_status(prev: str | None, in_chat: bool, actor_id: int | None, admin_ids: Collection[int]) -> str:
     """Статус чата после изменения прав бота.
 
-    Владелец (actor == owner) всегда активирует чат. Чужое добавление — «ждёт подтверждения».
+    Админ бота всегда активирует чат. Добавление кем-то другим — «ждёт подтверждения».
     Уже принятый чат остаётся принятым, если кто-то просто поменял боту права.
     """
     if not in_chat:
         return "left"
-    if actor_id is not None and actor_id == owner_id:
+    if actor_id is not None and actor_id in admin_ids:
         return "active"
     if prev in ("active", "pending"):
         return prev
@@ -152,7 +152,7 @@ class Repo:
         can_post: bool,
         can_pin: bool,
         actor_id: int | None,
-        owner_id: int,
+        admin_ids: Collection[int],
     ) -> ChatChange:
         async with self.db.session() as s:
             chat = await s.scalar(select(Chat).where(Chat.tg_id == tg_id))
@@ -163,7 +163,7 @@ class Repo:
                 chat = Chat(tg_id=tg_id)
                 s.add(chat)
             old_can_post = chat.can_post if prev is not None else False
-            status = next_chat_status(prev, in_chat, actor_id, owner_id)
+            status = next_chat_status(prev, in_chat, actor_id, admin_ids)
 
             chat.title = title or chat.title or str(tg_id)
             chat.username = username

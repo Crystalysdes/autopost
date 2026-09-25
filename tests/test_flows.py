@@ -27,9 +27,10 @@ from bot.services.scheduler import Scheduler
 from bot.setup import build_dispatcher
 from bot.states import Input
 from bot.ui.callbacks import ApplyDraft, CampAct, ChatAct, Nav, OptAct, PickAct, PostAct, SchedAct, SetAct
-from tests.conftest import BOT_ID, OWNER_ID, STRANGER_ID, FakeClock, admin_member, left_member
+from tests.conftest import BOT_ID, OWNER_ID, SECOND_ADMIN_ID, STRANGER_ID, FakeClock, admin_member, left_member
 
 OWNER = User(id=OWNER_ID, is_bot=False, first_name="Owner")
+SECOND = User(id=SECOND_ADMIN_ID, is_bot=False, first_name="Second")
 STRANGER = User(id=STRANGER_ID, is_bot=False, first_name="Stranger")
 BOT_USER = User(id=BOT_ID, is_bot=True, first_name="Autopost")
 _ids = itertools.count(1)
@@ -153,6 +154,29 @@ async def test_strangers_are_ignored(feed, session):
 async def test_group_chatter_is_ignored(feed, session):
     await feed(group_message(-100123, text="всем привет"))
     assert session.requests == []
+
+
+async def test_second_admin_has_full_access(feed, app, session):
+    await feed(private_message("/start", user=SECOND))
+    texts = [r.text for r in session.requests if isinstance(r, SendMessage) and r.chat_id == SECOND_ADMIN_ID]
+    assert any("Автопостинг" in text for text in texts)
+    chat = await add_chat(feed, app, -100450, actor=SECOND)
+    assert chat.status == "active"  # второй админ тоже «свой»
+
+
+async def test_notifications_go_to_all_admins(feed, app, session):
+    await add_chat(feed, app, -100460)
+    recipients = {r.chat_id for r in session.calls(SendMessage) if "Бот добавлен" in r.text}
+    assert recipients == {OWNER_ID, SECOND_ADMIN_ID}
+
+
+async def test_preview_goes_to_requesting_admin(feed, app, session):
+    chat = await add_chat(feed, app, -100470)
+    campaign = await app.repo.create_campaign(chat.id, "R")
+    await app.repo.add_post(campaign.id, kind="text", payload={"text": "Пост для второго"})
+    await feed(press(CampAct(a="preview", id=campaign.id), user=SECOND))
+    previews = [r.chat_id for r in session.calls(SendMessage) if r.text == "Пост для второго"]
+    assert previews == [SECOND_ADMIN_ID]
 
 
 # -------------------------------------------------------------------------- чаты

@@ -39,7 +39,7 @@ async def apply_member(app: App, *, chat: Any, member: Any, actor_id: int | None
         can_post=rights.can_post,
         can_pin=rights.can_pin,
         actor_id=actor_id,
-        owner_id=app.owner_id,
+        admin_ids=app.admin_ids,
     )
 
 

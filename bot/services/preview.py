@@ -1,4 +1,4 @@
-"""Предпросмотр постов в чате владельца + проверка, отображаются ли премиум-эмодзи."""
+"""Предпросмотр постов в чате админа + проверка, отображаются ли премиум-эмодзи."""
 
 from __future__ import annotations
 
@@ -21,14 +21,14 @@ PREMIUM_MISSING = (
 PREMIUM_OK = "💎 Премиум-эмодзи отображаются."
 
 
-async def send_preview(app: App, posts: Sequence[Post | PostData]) -> str:
-    """Присылает посты владельцу так, как они уйдут в чат. Возвращает заметку для экрана."""
+async def send_preview(app: App, posts: Sequence[Post | PostData], chat_id: int) -> str:
+    """Присылает посты админу (chat_id) так, как они уйдут в чат. Возвращает заметку для экрана."""
     expected = received = 0
     failures: list[str] = []
     for index, post in enumerate(posts, start=1):
         data = post if isinstance(post, PostData) else PostData.of(post)
         try:
-            result = await send_post(app.bot, app.owner_id, data)
+            result = await send_post(app.bot, chat_id, data)
         except (TelegramAPIError, PostSendError) as error:
             failures.append(f"пост #{index}: {html.escape(humanize(error))}")
             continue

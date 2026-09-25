@@ -49,6 +49,7 @@ from bot.db.base import Database
 from bot.db.repo import Repo
 
 OWNER_ID = 1000
+SECOND_ADMIN_ID = 1001
 BOT_ID = 4242
 STRANGER_ID = 2000
 
@@ -221,7 +222,7 @@ async def app(tmp_path, db: Database, repo: Repo, bot: Bot) -> App:
     config = Config(
         _env_file=None,
         bot_token="42:TEST",
-        admin_id=OWNER_ID,
+        admin_ids=[OWNER_ID, SECOND_ADMIN_ID],
         timezone="Europe/Moscow",
         db_path=tmp_path / "test.db",
     )

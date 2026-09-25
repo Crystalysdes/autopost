@@ -149,7 +149,7 @@ async def show_post(callback: CallbackQuery, callback_data: PostAct, app: App, c
         return await _gone(callback, app, callback_answer)
     callback_answer.disabled = True
     await callback.answer()
-    note = await send_preview(app, [post])
+    note = await send_preview(app, [post], callback.from_user.id)
     screen = await screens.post_view(app, post.id, note=note or "👆 Так пост будет выглядеть в чате.")
     if screen:
         await show(app, callback, screen, new=True)
@@ -204,7 +204,7 @@ async def on_buttons(message: Message, state: FSMContext, app: App) -> None:
     candidate.buttons = rows
     try:
         # Предпросмотр заодно проверяет ссылки: неправильные Telegram отклонит
-        await send_post(app.bot, app.owner_id, candidate)
+        await send_post(app.bot, message.chat.id, candidate)
     except TelegramBadRequest as error:
         await message.reply(f"⚠️ Telegram не принял кнопки: {t.esc(humanize(error))}\n\nИсправьте и пришлите снова.")
         return

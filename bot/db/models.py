@@ -32,7 +32,7 @@ class Chat(Base):
     username: Mapped[str | None] = mapped_column(String(64), default=None)
     type: Mapped[str] = mapped_column(String(16), default="supergroup")
     is_forum: Mapped[bool] = mapped_column(default=False)
-    # active — работает; pending — бота добавил не владелец, ждёт подтверждения; left — бота нет в чате
+    # active — работает; pending — бота добавил не админ, ждёт подтверждения; left — бота нет в чате
     status: Mapped[str] = mapped_column(String(16), default="active")
     is_admin: Mapped[bool] = mapped_column(default=False)
     can_post: Mapped[bool] = mapped_column(default=False)
@@ -95,7 +95,7 @@ class Post(Base):
     kind: Mapped[str] = mapped_column(String(16))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     buttons: Mapped[list[Any] | None] = mapped_column(JSON, default=None)
-    # Откуда пересылать: {"chat_id": ..., "message_ids": [...]} — сообщение в чате владельца с ботом
+    # Откуда пересылать: {"chat_id": ..., "message_ids": [...]} — сообщение в чате админа с ботом
     forward_from: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     send_mode: Mapped[str] = mapped_column(String(8), default="copy")
     created_ts: Mapped[int] = mapped_column(default=now_ts)

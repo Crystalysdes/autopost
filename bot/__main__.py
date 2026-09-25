@@ -90,12 +90,13 @@ async def run(config: Config) -> None:
     )
     app.scheduler = Scheduler(app)
     dp = build_dispatcher(app)
-    app.commands_ready = await setup_commands(bot, config.admin_id)
+    app.commands_ready = await setup_commands(bot, config.admin_ids)
 
     await app.scheduler.reschedule(only_missing=True)
     scheduler_task = asyncio.create_task(app.scheduler.run())
     refresh_task = asyncio.create_task(refresh_all(app))
-    logger.info("Бот @%s запущен. Владелец: %s. Часовой пояс: %s", me.username, config.admin_id, settings.timezone)
+    admins = ", ".join(map(str, config.admin_ids))
+    logger.info("Бот @%s запущен. Админы: %s. Часовой пояс: %s", me.username, admins, settings.timezone)
     try:
         # Апдейты, накопившиеся за время простоя, не сбрасываем: среди них могут быть
         # добавления бота в новые чаты.
@@ -113,8 +114,11 @@ def main() -> None:
     try:
         config = Config()
     except ValidationError as error:
-        missing = ", ".join(str(e["loc"][0]).upper() for e in error.errors())
-        sys.exit(f"Проверьте настройки в .env (см. .env.example). Проблема с: {missing}")
+        problems = []
+        for item in error.errors():
+            field = str(item["loc"][0]).upper() if item["loc"] else ""
+            problems.append(f"{field}: {item['msg']}" if field else item["msg"].removeprefix("Value error, "))
+        sys.exit("Проверьте настройки в .env (см. .env.example):\n  " + "\n  ".join(problems))
 
     logging.basicConfig(
         level=config.log_level,

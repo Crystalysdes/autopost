@@ -117,7 +117,7 @@ async def backup(callback: CallbackQuery, app: App, callback_answer: CallbackAns
     try:
         await app.db.backup_to(target)
         await app.bot.send_document(
-            app.owner_id,
+            callback.from_user.id,
             FSInputFile(target, filename=f"autopost-backup-{stamp}.db"),
             caption=(
                 "💾 Резервная копия базы: чаты, рассылки, посты и черновики.\n\n"

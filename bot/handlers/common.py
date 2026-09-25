@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -31,22 +32,28 @@ COMMANDS = [
 ]
 
 
-async def setup_commands(bot: Bot, owner_id: int) -> bool:
-    """Меню команд видно только владельцу; остальным бот ничего не показывает."""
+async def setup_commands(bot: Bot, admin_ids: Iterable[int]) -> set[int]:
+    """Меню команд видно только админам; остальным бот ничего не показывает.
+    Возвращает админов, которым меню установлено (остальным — после их /start)."""
+    ready: set[int] = set()
+    for admin_id in admin_ids:
+        try:
+            await bot.set_my_commands(COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+            ready.add(admin_id)
+        except TelegramAPIError as error:
+            logger.info("Меню команд для %s пока не установлено (%s) — повторю после /start", admin_id, error)
     try:
-        await bot.set_my_commands(COMMANDS, scope=BotCommandScopeChat(chat_id=owner_id))
         await bot.delete_my_commands(scope=BotCommandScopeDefault())
-        return True
     except TelegramAPIError as error:
-        logger.info("Команды пока не установлены (%s) — повторю после /start", error)
-        return False
+        logger.info("Не удалось очистить общее меню команд: %s", error)
+    return ready
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, app: App) -> None:
     await state.clear()
-    if not app.commands_ready:
-        app.commands_ready = await setup_commands(app.bot, app.owner_id)
+    if message.from_user.id not in app.commands_ready:
+        app.commands_ready |= await setup_commands(app.bot, [message.from_user.id])
     await message.answer(
         "👋 Панель автопостинга. Кнопки внизу экрана добавляют бота в группу или канал.",
         reply_markup=keyboards.add_chat_reply(),

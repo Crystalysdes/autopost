@@ -68,15 +68,20 @@ class App:
     bot_id: int = 0
     bot_username: str = ""
     scheduler: Scheduler | None = field(default=None, repr=False)
-    commands_ready: bool = False
+    # Админы, которым уже установлено меню команд
+    commands_ready: set[int] = field(default_factory=set)
 
     @property
-    def owner_id(self) -> int:
-        return self.config.admin_id
+    def admin_ids(self) -> tuple[int, ...]:
+        return tuple(self.config.admin_ids)
+
+    def is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.config.admin_ids
 
     async def notify(self, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
-        """Сообщение владельцу. Ошибки (например, владелец заблокировал бота) только логируются."""
-        try:
-            await self.bot.send_message(self.owner_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
-        except TelegramAPIError as error:
-            logger.warning("Не удалось отправить уведомление владельцу: %s", error)
+        """Сообщение всем админам. Ошибки (например, админ ещё не открыл бота) только логируются."""
+        for admin_id in self.admin_ids:
+            try:
+                await self.bot.send_message(admin_id, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+            except TelegramAPIError as error:
+                logger.warning("Не удалось отправить уведомление админу %s: %s", admin_id, error)

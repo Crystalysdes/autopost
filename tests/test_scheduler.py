@@ -54,7 +54,7 @@ async def make_campaign(app, *, times=("09:00",), posts=("Пост 1",), chat_tg
         can_post=True,
         can_pin=True,
         actor_id=OWNER_ID,
-        owner_id=OWNER_ID,
+        admin_ids=[OWNER_ID],
     )
     campaign = await app.repo.create_campaign(change.chat.id, "Реклама")
     for text in posts:

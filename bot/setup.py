@@ -20,7 +20,7 @@ from bot.handlers import (
     schedule,
     settings,
 )
-from bot.middlewares.access import OwnerOnlyMiddleware
+from bot.middlewares.access import AdminOnlyMiddleware
 from bot.middlewares.album import AlbumMiddleware
 
 
@@ -28,7 +28,7 @@ def build_dispatcher(app: App, *, album_latency: float = 0.8) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     dp["app"] = app
 
-    access = OwnerOnlyMiddleware(app.owner_id)
+    access = AdminOnlyMiddleware(app.admin_ids)
     dp.message.outer_middleware(access)
     dp.callback_query.outer_middleware(access)
     dp.message.outer_middleware(AlbumMiddleware(latency=album_latency))

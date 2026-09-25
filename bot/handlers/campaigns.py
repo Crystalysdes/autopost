@@ -74,7 +74,7 @@ async def preview(callback: CallbackQuery, callback_data: CampAct, app: App, cal
         return
     callback_answer.disabled = True
     await callback.answer("Отправляю предпросмотр…")
-    note = await send_preview(app, posts)
+    note = await send_preview(app, posts, callback.from_user.id)
     header = f"👆 Так посты будут выглядеть в чате ({len(posts)})."
     screen = await screens.campaign_view(app, callback_data.id, note="\n".join(filter(None, [header, note])))
     if screen:

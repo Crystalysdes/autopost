@@ -17,19 +17,21 @@ async def add_chat(repo: Repo, tg_id: int, *, actor: int = OWNER, title: str = "
         can_post=True,
         can_pin=True,
         actor_id=actor,
-        owner_id=OWNER,
+        admin_ids=[OWNER],
     )
     return change
 
 
 def test_next_chat_status_rules():
-    assert next_chat_status(None, True, OWNER, OWNER) == "active"
-    assert next_chat_status(None, True, 5, OWNER) == "pending"
-    assert next_chat_status(None, True, None, OWNER) == "pending"
-    assert next_chat_status("active", True, 5, OWNER) == "active"  # чужой админ поменял права
-    assert next_chat_status("pending", True, OWNER, OWNER) == "active"
-    assert next_chat_status("left", True, 5, OWNER) == "pending"
-    assert next_chat_status("active", False, OWNER, OWNER) == "left"
+    admins = {OWNER, 77}
+    assert next_chat_status(None, True, OWNER, admins) == "active"
+    assert next_chat_status(None, True, 77, admins) == "active"  # второй админ
+    assert next_chat_status(None, True, 5, admins) == "pending"
+    assert next_chat_status(None, True, None, admins) == "pending"
+    assert next_chat_status("active", True, 5, admins) == "active"  # чужой админ чата поменял права
+    assert next_chat_status("pending", True, OWNER, admins) == "active"
+    assert next_chat_status("left", True, 5, admins) == "pending"
+    assert next_chat_status("active", False, OWNER, admins) == "left"
 
 
 async def test_upsert_and_leave_pauses_campaigns(repo: Repo):
@@ -50,7 +52,7 @@ async def test_upsert_and_leave_pauses_campaigns(repo: Repo):
         can_post=False,
         can_pin=False,
         actor_id=5,
-        owner_id=OWNER,
+        admin_ids=[OWNER],
     )
     assert left.status == "left" and left.prev_status == "active" and left.paused == 1
     campaign = await repo.get_campaign(campaign.id)
@@ -70,7 +72,7 @@ async def test_lost_post_right_flag(repo: Repo):
         can_post=False,
         can_pin=False,
         actor_id=5,
-        owner_id=OWNER,
+        admin_ids=[OWNER],
     )
     assert change.lost_post_right and change.status == "active"
 
@@ -87,7 +89,7 @@ async def test_unknown_chat_leave_is_noop(repo: Repo):
         can_post=False,
         can_pin=False,
         actor_id=OWNER,
-        owner_id=OWNER,
+        admin_ids=[OWNER],
     )
     assert change.chat is None
     assert await repo.list_chats() == []
