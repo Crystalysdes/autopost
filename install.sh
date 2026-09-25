@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Установка бота автопостинга на Ubuntu/Debian — рядом с другими ботами, ничего у них не трогая.
 #
-#   sudo bash install.sh                 установить (спросит токен бота и ID админов)
-#   sudo bash install.sh --reconfigure   поменять токен или админов
-#   sudo bash install.sh --update        обновить код из GitHub и перезапустить
-#   sudo bash install.sh --uninstall     удалить службу (папка с базой остаётся)
+#   sudo bash install.sh                        установить (спросит токен бота и ID админов)
+#   sudo bash install.sh --reconfigure          поменять токен или админов
+#   sudo bash install.sh --update               обновить код из GitHub и перезапустить
+#   sudo bash install.sh --update-zip АРХИВ.zip обновить из ZIP-архива (если сервер не видит GitHub)
+#   sudo bash install.sh --uninstall            удалить службу (папка с базой остаётся)
 #
 # Что создаётся: своё окружение Python в папке бота (.venv), системный пользователь «autopost»
 # и служба systemd «autopost-bot». Порты не открываются, системный Python и чужие файлы не меняются.
@@ -22,6 +23,7 @@ ID_RE='^[0-9]{5,15}$'
 
 MODE="install"
 NO_SERVICE=0
+ZIP_PATH=""
 TOKEN=""
 ADMIN_IDS=""
 BOT_USERNAME=""
@@ -335,10 +337,47 @@ uninstall() {
 update_code() {
     if [ -d "$APP_DIR/.git" ] && command -v git >/dev/null 2>&1; then
         info "Скачиваю обновление из GitHub…"
-        git -C "$APP_DIR" pull --ff-only
+        git -C "$APP_DIR" pull --ff-only ||
+            die "Не удалось скачать обновление из GitHub. Если сервер не видит GitHub, обновите из архива: sudo bash $APP_DIR/install.sh --update-zip /root/autopost.zip"
     else
-        warn "Папка установлена не через git — обновите файлы вручную и запустите install.sh ещё раз."
+        warn "Папка установлена не через git — код не скачиваю. Обновить из архива: sudo bash $APP_DIR/install.sh --update-zip /root/autopost.zip"
     fi
+}
+
+# Новая версия из ZIP-архива (например, скачанного с GitHub на компьютере и переданного через scp).
+# Настройки (.env), база (data/) и окружение Python (.venv) остаются прежними.
+update_from_zip() {
+    local zip="$1" tmp main src
+    [ -f "$zip" ] || die "Архив не найден: $zip"
+    find_python || die "Нужен Python 3.11 или новее."
+    tmp="$(mktemp -d)"
+    info "Распаковываю $zip…"
+    if ! "$PYTHON" - "$zip" "$tmp" <<'PY'; then
+import sys
+import zipfile
+
+zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
+PY
+        rm -rf "$tmp"
+        die "Не удалось распаковать архив — скачайте его заново."
+    fi
+    # В архиве с GitHub всё лежит в папке вида autopost-ветка/
+    main="$(find "$tmp" -maxdepth 3 -type f -path '*/bot/__main__.py' | head -n 1)"
+    src="$(dirname "$(dirname "${main:-$tmp/x/y}")")"
+    if [ -z "$main" ] || [ ! -f "$src/install.sh" ] || [ ! -f "$src/requirements.txt" ]; then
+        rm -rf "$tmp"
+        die "В архиве нет бота автопостинга (bot/, install.sh, requirements.txt)."
+    fi
+    rm -rf "$src/.env" "$src/data" "$src/.venv"
+    info "Обновляю файлы бота (настройки .env и база data/ остаются как были)…"
+    # Папку с кодом подменяем целиком, чтобы не остались файлы, удалённые в новой версии
+    rm -rf "$APP_DIR/bot.new" "$APP_DIR/bot.old"
+    cp -a "$src/bot" "$APP_DIR/bot.new"
+    rm -rf "$src/bot"
+    cp -a "$src/." "$APP_DIR/"
+    mv "$APP_DIR/bot" "$APP_DIR/bot.old"
+    mv "$APP_DIR/bot.new" "$APP_DIR/bot"
+    rm -rf "$APP_DIR/bot.old" "$tmp"
 }
 
 check_foreign_unit() {
@@ -363,23 +402,36 @@ print_summary() {
     say "  перезапуск:          sudo systemctl restart $SERVICE"
     say "  токен/админы:        sudo bash $APP_DIR/install.sh --reconfigure"
     say "  обновить бота:       sudo bash $APP_DIR/install.sh --update"
+    say "  обновить из архива:  sudo bash $APP_DIR/install.sh --update-zip /root/autopost.zip"
     say "  удалить службу:      sudo bash $APP_DIR/install.sh --uninstall"
 }
 
 main() {
-    for arg in "$@"; do
-        case "$arg" in
+    local args=("$@")
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
             --reconfigure) MODE="reconfigure" ;;
             --update) MODE="update" ;;
+            --update-zip)
+                [ "$#" -ge 2 ] || die "Укажите архив: --update-zip /root/autopost.zip"
+                MODE="update-zip"
+                ZIP_PATH="$2"
+                shift
+                ;;
+            --update-zip=*)
+                MODE="update-zip"
+                ZIP_PATH="${1#*=}"
+                ;;
             --after-update) MODE="updated" ;;
             --uninstall) MODE="uninstall" ;;
             --no-service) NO_SERVICE=1 ;;
             -h | --help)
-                sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
                 return 0
                 ;;
-            *) die "Неизвестный параметр: $arg (см. --help)" ;;
+            *) die "Неизвестный параметр: $1 (см. --help)" ;;
         esac
+        shift
     done
 
     if [ ! -f "$APP_DIR/bot/__main__.py" ] || [ ! -f "$APP_DIR/requirements.txt" ]; then
@@ -388,7 +440,7 @@ main() {
 
     if [ "$(id -u)" -ne 0 ] && [ "$NO_SERVICE" -eq 0 ]; then
         command -v sudo >/dev/null 2>&1 || die "Нужны права root: запустите от root."
-        exec sudo --preserve-env=AUTOPOST_BOT_TOKEN,AUTOPOST_ADMIN_IDS bash "${BASH_SOURCE[0]}" "$@"
+        exec sudo --preserve-env=AUTOPOST_BOT_TOKEN,AUTOPOST_ADMIN_IDS bash "${BASH_SOURCE[0]}" "${args[@]}"
     fi
     if [ "$NO_SERVICE" -eq 0 ]; then
         [ -d /run/systemd/system ] || die "На сервере нет systemd — эта установка рассчитана на Ubuntu/Debian."
@@ -400,8 +452,12 @@ main() {
             uninstall
             return 0
             ;;
-        update)
-            update_code
+        update | update-zip)
+            if [ "$MODE" = "update" ]; then
+                update_code
+            else
+                update_from_zip "$ZIP_PATH"
+            fi
             # Дальше продолжает уже обновлённая версия скрипта
             exec bash "$APP_DIR/install.sh" --after-update
             ;;

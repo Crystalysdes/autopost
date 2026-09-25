@@ -14,10 +14,12 @@ from bot.handlers import (
     drafts,
     fallback,
     group_events,
+    library,
     options,
     posts,
     schedule,
     settings,
+    targets,
 )
 from bot.middlewares.access import AdminOnlyMiddleware
 from bot.middlewares.album import AlbumMiddleware
@@ -47,6 +49,8 @@ def build_dispatcher(app: App, *, album_latency: float = 0.8, double_tap_window:
         posts.router,
         schedule.router,
         options.router,
+        targets.router,
+        library.router,
         drafts.router,
         settings.router,
         fallback.router,

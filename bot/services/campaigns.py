@@ -1,11 +1,12 @@
-"""Проверки перед запуском рассылки."""
+"""Проверки перед запуском рассылки и состояние её чатов."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from zoneinfo import ZoneInfo
 
-from bot.db.models import Campaign, Chat, Post
+from bot.db.models import Campaign, Post
+from bot.db.repo import Target
 from bot.services.schedule_utils import next_slot
 
 
@@ -26,15 +27,29 @@ def schedule_problems(campaign: Campaign, posts: Sequence[Post], tz: ZoneInfo, n
     return problems
 
 
-def chat_problems(chat: Chat | None) -> list[str]:
-    if chat is None or chat.status != "active":
-        return ["Чат недоступен: бот не состоит в нём или чат не подтверждён"]
+def target_problem(target: Target) -> str | None:
+    """Почему бот сейчас не публикует в этот чат (None — публикует)."""
+    chat, link = target.chat, target.link
+    if chat.status == "left":
+        return "бота нет в чате"
+    if chat.status == "pending":
+        return "чат не подтверждён"
     if not chat.can_post:
-        return ["У бота нет права публиковать в этом чате"]
+        return "нет права публиковать"
+    if link.paused:
+        return "пауза после ошибок"
+    return None
+
+
+def targets_problems(targets: Sequence[Target]) -> list[str]:
+    if not targets:
+        return ["Отметьте чаты, в которые публиковать, — кнопка «💬 Чаты»"]
+    if not any(target.deliverable for target in targets):
+        return ["Ни в одном из отмеченных чатов бот сейчас не может публиковать — откройте «💬 Чаты»"]
     return []
 
 
 def readiness_problems(
-    campaign: Campaign, posts: Sequence[Post], chat: Chat | None, tz: ZoneInfo, now: int
+    campaign: Campaign, posts: Sequence[Post], targets: Sequence[Target], tz: ZoneInfo, now: int
 ) -> list[str]:
-    return chat_problems(chat) + schedule_problems(campaign, posts, tz, now)
+    return targets_problems(targets) + schedule_problems(campaign, posts, tz, now)

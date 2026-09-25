@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.methods import DeleteMessages, PinChatMessage, SendMessage, UnpinChatMessage
 
+from bot.db.repo import DRAFT
 from bot.handlers.settings import parse_timezone
 from bot.middlewares.taps import DoubleTapMiddleware
 from bot.services import scheduler as scheduler_module
@@ -61,7 +62,7 @@ async def make_campaign(app, *, times=("12:00",), posts=("Пост",), chat_tg=C
         actor_id=OWNER_ID,
         admin_ids=[OWNER_ID],
     )
-    campaign = await app.repo.create_campaign(change.chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[change.chat.id])
     for text in posts:
         await app.repo.add_post(campaign.id, kind="text", payload={"text": text})
     await app.repo.update_campaign(campaign.id, times=list(times), is_active=True, **options)
@@ -108,18 +109,16 @@ async def test_double_tap_middleware_drops_repeats():
     assert calls == ["k:new:1", "k:new:1", "k:new:2"]
 
 
-async def test_concurrent_apply_creates_one_copy(dp, bot, app):  # noqa: F811
+async def test_concurrent_apply_creates_one_campaign(dp, bot, app):  # noqa: F811
     await feed_updates(dp, bot, membership(-103001), membership(-103002))
-    chat_a = await app.repo.get_chat_by_tg(-103001)
     chat_b = await app.repo.get_chat_by_tg(-103002)
-    campaign = await app.repo.create_campaign(chat_a.id, "R")
-    await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
-    await app.repo.update_campaign(campaign.id, times=["12:00"])
-    await feed_updates(
-        dp, bot, press(CampAct(a="copy", id=campaign.id)), press(PickAct(a="t", s=campaign.id, v=chat_b.id))
-    )
-    go = PickAct(a="go", s=campaign.id, v=1)
+    draft = await app.repo.create_campaign("R", kind=DRAFT)
+    await app.repo.add_post(draft.id, kind="text", payload={"text": "x"})
+    await app.repo.update_campaign(draft.id, times=["12:00"])
+    await feed_updates(dp, bot, press(CampAct(a="apply", id=draft.id)), press(PickAct(a="t", s=draft.id, v=chat_b.id)))
+    go = PickAct(a="go", s=draft.id, v=1)
     await asyncio.gather(dp.feed_update(bot, press(go)), dp.feed_update(bot, press(go)))
+    assert len(await app.repo.list_campaigns()) == 1
     assert len(await app.repo.list_campaigns(chat_b.id)) == 1
 
 
@@ -246,7 +245,7 @@ async def test_accept_does_not_revive_left_chat(dp, bot, app):  # noqa: F811
 async def test_album_survives_done_pressed_during_wait(dp, bot, app):  # noqa: F811
     await feed_updates(dp, bot, membership(-105001))
     chat = await app.repo.get_chat_by_tg(-105001)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await feed_updates(dp, bot, press(CampAct(a="add", id=campaign.id)))
     parts = [
         private_message(
@@ -267,7 +266,7 @@ async def test_album_survives_done_pressed_during_wait(dp, bot, app):  # noqa: F
 async def test_button_press_ends_post_input(dp, bot, app):  # noqa: F811
     await feed_updates(dp, bot, membership(-105002))
     chat = await app.repo.get_chat_by_tg(-105002)
-    first = await app.repo.create_campaign(chat.id, "Первая")
+    first = await app.repo.create_campaign("Первая", chat_ids=[chat.id])
     await feed_updates(dp, bot, press(CampAct(a="add", id=first.id)))
     assert await state_of(dp, bot) == Input.posts.state
     await feed_updates(dp, bot, press(ChatAct(a="new", id=chat.id)), private_message("случайный текст"))
@@ -330,9 +329,9 @@ async def test_migration_merge_records_to_new_chat_and_forgets_old_ids(app, sche
     session.queue(SendMessage, TelegramMigrateToChat(method=None, message="migrated", migrate_to_chat_id=-1007007))
     clock.value = at(10) + 1
     await run_tick(scheduler)
-    fresh = await app.repo.get_campaign(campaign.id)
     new_chat = await app.repo.get_chat_by_tg(-1007007)
-    assert fresh.chat_id == new_chat.id and fresh.sent_count == 2
+    targets = await app.repo.campaign_targets(campaign.id)
+    assert [t.chat.id for t in targets] == [new_chat.id] and targets[0].link.sent_count == 2
     assert not session.calls(DeleteMessages)  # старые id в супергруппе чужие — их не трогаем
     assert await app.repo.get_chat(old_chat.id) is None
 

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import Connection, event, inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
+from bot.db.migrations import run_migrations
 from bot.db.models import Base
 
 
@@ -53,6 +54,7 @@ class Database:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(_add_missing_columns)
+        await run_migrations(self)
 
     def session(self) -> AsyncSession:
         return self.sessionmaker()

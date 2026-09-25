@@ -2,6 +2,10 @@
 
 Объекты, которые возвращают методы, «отсоединены» от сессии (expire_on_commit=False):
 их можно читать, но изменения нужно сохранять через методы репозитория.
+
+Рассылка (kind="campaign") публикует одни и те же посты по одному расписанию в несколько чатов.
+Отмеченные чаты и состояние отправки в каждый из них — CampaignChat («цель»).
+Черновик (kind="draft") — заготовка рассылки без чатов.
 """
 
 from __future__ import annotations
@@ -15,10 +19,11 @@ from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import Database
-from bot.db.models import ALL_WEEKDAYS, Campaign, Chat, Post, SendLog, Setting, now_ts
+from bot.db.models import ALL_WEEKDAYS, Campaign, CampaignChat, Chat, Post, SendLog, Setting, now_ts
 
-# Что переносится при копировании рассылки / применении черновика.
-# Тема форума (thread_id), статус и счётчики принадлежат конкретному чату и не копируются.
+CAMPAIGN, DRAFT = "campaign", "draft"
+
+# Что переносится из черновика в рассылку и обратно. Чаты, статус и счётчики у каждой рассылки свои.
 TEMPLATE_FIELDS = (
     "times",
     "weekdays",
@@ -31,7 +36,7 @@ TEMPLATE_FIELDS = (
     "pin",
     "delete_prev",
 )
-POST_FIELDS = ("position", "kind", "payload", "buttons", "forward_from", "send_mode")
+POST_FIELDS = ("kind", "payload", "buttons", "forward_from", "send_mode")
 
 NAME_LIMIT = 64
 
@@ -44,11 +49,24 @@ class ChatChange:
     prev_status: str | None
     status: str | None
     lost_post_right: bool = False
-    paused: int = 0
 
     @property
     def is_new(self) -> bool:
         return self.prev_status is None and self.chat is not None
+
+
+@dataclass
+class Target:
+    """Чат, отмеченный в рассылке: связь с состоянием отправки и сам чат."""
+
+    link: CampaignChat
+    chat: Chat
+
+    @property
+    def deliverable(self) -> bool:
+        """Можно ли сейчас публиковать в этот чат. Остальные чаты просто пропускаются
+        и сами возвращаются в работу, когда проблема исчезнет (кроме паузы после ошибок)."""
+        return self.chat.status == "active" and self.chat.can_post and not self.link.paused
 
 
 @dataclass
@@ -65,7 +83,7 @@ class ClaimDecision:
 @dataclass
 class Claim:
     campaign: Campaign
-    chat: Chat
+    targets: list[Target]  # куда публиковать этот слот (только доступные чаты)
     decision: ClaimDecision
 
 
@@ -84,9 +102,37 @@ def next_chat_status(prev: str | None, in_chat: bool, actor_id: int | None, admi
     return "pending"
 
 
+def chat_sort_key(chat: Chat) -> tuple[bool, str, int]:
+    # SQLite не умеет сортировать кириллицу без учёта регистра — сортируем в Python
+    return chat.status != "active", chat.title.casefold(), chat.id
+
+
 def _clip_name(name: str) -> str:
     name = " ".join(name.split())
     return name[:NAME_LIMIT] or "Без названия"
+
+
+def _blank(name: str, kind: str) -> Campaign:
+    return Campaign(
+        kind=kind,
+        name=_clip_name(name),
+        is_active=False,
+        times=[],
+        weekdays=list(ALL_WEEKDAYS),
+        jitter_min=0,
+        rotation="sequential",
+        silent=False,
+        protect=False,
+        pin=False,
+        delete_prev=False,
+        last_message_ids=[],
+        sent_count=0,
+        fail_count=0,
+    )
+
+
+def _copy_post(post: Post, campaign_id: int, position: int) -> Post:
+    return Post(campaign_id=campaign_id, position=position, **{f: copy.deepcopy(getattr(post, f)) for f in POST_FIELDS})
 
 
 class Repo:
@@ -121,21 +167,20 @@ class Repo:
             if statuses is not None:
                 query = query.where(Chat.status.in_(list(statuses)))
             chats = list((await s.scalars(query)).all())
-        # SQLite не умеет сортировать кириллицу без учёта регистра — сортируем в Python
-        chats.sort(key=lambda c: (c.status != "active", c.title.casefold(), c.id))
+        chats.sort(key=chat_sort_key)
         return chats
 
     async def campaign_stats_by_chat(self) -> dict[int, tuple[int, int]]:
-        """chat_id -> (всего рассылок, активных)."""
+        """chat_id -> (рассылок, где отмечен чат; из них публикуют в него сейчас)."""
         async with self.db.session() as s:
             rows = await s.execute(
                 select(
-                    Campaign.chat_id,
-                    func.count(Campaign.id),
-                    func.sum(case((Campaign.is_active.is_(True), 1), else_=0)),
+                    CampaignChat.chat_id,
+                    func.count(CampaignChat.id),
+                    func.sum(case((Campaign.is_active.is_(True) & CampaignChat.paused.is_(False), 1), else_=0)),
                 )
-                .where(Campaign.chat_id.is_not(None))
-                .group_by(Campaign.chat_id)
+                .join(Campaign, Campaign.id == CampaignChat.campaign_id)
+                .group_by(CampaignChat.chat_id)
             )
             return {chat_id: (int(total), int(active or 0)) for chat_id, total, active in rows}
 
@@ -154,6 +199,8 @@ class Repo:
         actor_id: int | None,
         admin_ids: Collection[int],
     ) -> ChatChange:
+        """Бот вышел из чата — рассылки не трогаем: этот чат просто пропускается при публикации
+        и возвращается в работу, когда бота добавят снова."""
         async with self.db.session() as s:
             chat = await s.scalar(select(Chat).where(Chat.tg_id == tg_id))
             prev = chat.status if chat else None
@@ -176,18 +223,12 @@ class Repo:
             if prev in (None, "left") and in_chat:
                 chat.added_by = actor_id
             chat.updated_ts = now_ts()
-
-            paused = 0
-            if status == "left" and prev != "left":
-                await s.flush()
-                paused = await self._pause_chat_campaigns(s, chat.id)
             await s.commit()
             return ChatChange(
                 chat=chat,
                 prev_status=prev,
                 status=status,
                 lost_post_right=bool(prev == status == "active" and old_can_post and not can_post),
-                paused=paused,
             )
 
     async def set_chat_status(self, chat_id: int, status: str) -> Chat | None:
@@ -197,12 +238,11 @@ class Repo:
                 return None
             chat.status = status
             chat.updated_ts = now_ts()
-            if status == "left":
-                await self._pause_chat_campaigns(s, chat_id)
             await s.commit()
             return chat
 
     async def delete_chat(self, chat_id: int) -> None:
+        """Чат пропадает из рассылок (ON DELETE CASCADE по campaign_chats), сами рассылки остаются."""
         async with self.db.session() as s:
             await s.execute(delete(Chat).where(Chat.id == chat_id))
             await s.commit()
@@ -211,7 +251,7 @@ class Repo:
         """Группа превратилась в супергруппу: у чата новый id. Идемпотентно.
 
         Если запись для нового id уже успела появиться (апдейт пришёл раньше сервисного
-        сообщения о миграции), рассылки переносятся в неё, а старая запись удаляется.
+        сообщения о миграции), отметки в рассылках переносятся в неё, а старая запись удаляется.
         """
         async with self.db.session() as s:
             old = await s.scalar(select(Chat).where(Chat.tg_id == old_tg_id))
@@ -219,14 +259,19 @@ class Repo:
             if old is None:
                 return new
             # id прошлых сообщений относятся к старой группе — в супергруппе это были бы чужие сообщения
-            await s.execute(update(Campaign).where(Campaign.chat_id == old.id).values(last_message_ids=[]))
+            await s.execute(update(CampaignChat).where(CampaignChat.chat_id == old.id).values(last_message_ids=[]))
             if new is None:
                 old.tg_id = new_tg_id
                 old.type = "supergroup"
                 old.updated_ts = now_ts()
                 await s.commit()
                 return old
-            await s.execute(update(Campaign).where(Campaign.chat_id == old.id).values(chat_id=new.id))
+            taken = list(await s.scalars(select(CampaignChat.campaign_id).where(CampaignChat.chat_id == new.id)))
+            if taken:  # рассылка уже отмечена в новом чате — вторая отметка не нужна
+                await s.execute(
+                    delete(CampaignChat).where(CampaignChat.chat_id == old.id, CampaignChat.campaign_id.in_(taken))
+                )
+            await s.execute(update(CampaignChat).where(CampaignChat.chat_id == old.id).values(chat_id=new.id))
             await s.execute(update(SendLog).where(SendLog.chat_id == old.id).values(chat_id=new.id))
             rank = {"active": 2, "pending": 1, "left": 0}
             if rank.get(old.status, 0) > rank.get(new.status, 0):
@@ -237,41 +282,15 @@ class Repo:
             await s.commit()
             return new
 
-    async def _pause_chat_campaigns(self, s: AsyncSession, chat_id: int) -> int:
-        result = await s.execute(
-            update(Campaign)
-            .where(Campaign.chat_id == chat_id, Campaign.is_active.is_(True))
-            .values(is_active=False, next_slot_ts=None, next_run_ts=None)
-        )
-        return int(result.rowcount or 0)
-
-    async def pause_chat_campaigns(self, chat_id: int) -> int:
-        async with self.db.session() as s:
-            count = await self._pause_chat_campaigns(s, chat_id)
-            await s.commit()
-            return count
-
     # ----------------------------------------------------------------- campaigns
 
-    async def create_campaign(self, chat_id: int | None, name: str) -> Campaign:
+    async def create_campaign(self, name: str, *, kind: str = CAMPAIGN, chat_ids: Iterable[int] = ()) -> Campaign:
         async with self.db.session() as s:
-            campaign = Campaign(
-                chat_id=chat_id,
-                name=_clip_name(name),
-                is_active=False,
-                times=[],
-                weekdays=list(ALL_WEEKDAYS),
-                jitter_min=0,
-                rotation="sequential",
-                silent=False,
-                protect=False,
-                pin=False,
-                delete_prev=False,
-                last_message_ids=[],
-                sent_count=0,
-                fail_count=0,
-            )
+            campaign = _blank(name, kind)
             s.add(campaign)
+            await s.flush()
+            for chat_id in dict.fromkeys(chat_ids):
+                s.add(CampaignChat(campaign_id=campaign.id, chat_id=chat_id))
             await s.commit()
             return campaign
 
@@ -279,19 +298,28 @@ class Repo:
         async with self.db.session() as s:
             return await s.get(Campaign, campaign_id)
 
-    async def list_campaigns(self, chat_id: int) -> list[Campaign]:
+    async def list_campaigns(self, chat_id: int | None = None) -> list[Campaign]:
+        """Все рассылки или только те, где отмечен чат."""
         async with self.db.session() as s:
-            rows = await s.scalars(select(Campaign).where(Campaign.chat_id == chat_id).order_by(Campaign.id))
-            return list(rows.all())
+            query = select(Campaign).where(Campaign.kind == CAMPAIGN)
+            if chat_id is not None:
+                query = query.join(CampaignChat, CampaignChat.campaign_id == Campaign.id).where(
+                    CampaignChat.chat_id == chat_id
+                )
+            return list((await s.scalars(query.order_by(Campaign.id))).all())
 
     async def list_drafts(self) -> list[Campaign]:
         async with self.db.session() as s:
-            rows = await s.scalars(select(Campaign).where(Campaign.chat_id.is_(None)).order_by(Campaign.id))
+            rows = await s.scalars(select(Campaign).where(Campaign.kind == DRAFT).order_by(Campaign.id))
             return list(rows.all())
 
-    async def count_campaigns(self, chat_id: int) -> int:
+    async def count_campaigns(self, chat_id: int | None = None) -> int:
         async with self.db.session() as s:
-            return int(await s.scalar(select(func.count(Campaign.id)).where(Campaign.chat_id == chat_id)) or 0)
+            if chat_id is not None:
+                query = select(func.count(CampaignChat.id)).where(CampaignChat.chat_id == chat_id)
+            else:
+                query = select(func.count(Campaign.id)).where(Campaign.kind == CAMPAIGN)
+            return int(await s.scalar(query) or 0)
 
     async def update_campaign(self, campaign_id: int, **values: Any) -> Campaign | None:
         async with self.db.session() as s:
@@ -312,68 +340,162 @@ class Repo:
             await s.commit()
 
     async def linked_campaigns(self, draft_id: int) -> list[Campaign]:
+        """Рассылки, созданные из черновика или сохранённые в него."""
         async with self.db.session() as s:
             rows = await s.scalars(
                 select(Campaign)
-                .where(Campaign.source_draft_id == draft_id, Campaign.chat_id.is_not(None))
+                .where(Campaign.source_draft_id == draft_id, Campaign.kind == CAMPAIGN)
                 .order_by(Campaign.id)
             )
             return list(rows.all())
 
     async def linked_counts(self) -> dict[int, int]:
+        """draft_id -> в скольких чатах публикуются рассылки из этого черновика."""
         async with self.db.session() as s:
             rows = await s.execute(
-                select(Campaign.source_draft_id, func.count(Campaign.id))
-                .where(Campaign.source_draft_id.is_not(None), Campaign.chat_id.is_not(None))
+                select(Campaign.source_draft_id, func.count(func.distinct(CampaignChat.chat_id)))
+                .join(CampaignChat, CampaignChat.campaign_id == Campaign.id)
+                .where(Campaign.source_draft_id.is_not(None), Campaign.kind == CAMPAIGN)
                 .group_by(Campaign.source_draft_id)
             )
             return {int(draft_id): int(count) for draft_id, count in rows}
 
-    async def active_campaigns_with_chats(self) -> list[tuple[Campaign, Chat]]:
+    async def active_campaigns(self) -> list[Campaign]:
+        """Включённые рассылки, ближайшие публикации — первыми."""
         async with self.db.session() as s:
-            rows = await s.execute(
-                select(Campaign, Chat)
-                .join(Chat, Chat.id == Campaign.chat_id)
-                .where(Campaign.is_active.is_(True), Chat.status == "active")
-                .order_by(Campaign.next_run_ts)
+            rows = await s.scalars(
+                select(Campaign)
+                .where(Campaign.kind == CAMPAIGN, Campaign.is_active.is_(True))
+                .order_by(Campaign.next_run_ts.is_(None), Campaign.next_run_ts, Campaign.id)
             )
-            return [(c, chat) for c, chat in rows.all()]
+            return list(rows.all())
 
     async def campaign_totals(self) -> tuple[int, int]:
-        """(всего рассылок в чатах, активных)."""
+        """(всего рассылок, включённых)."""
         async with self.db.session() as s:
             row = (
                 await s.execute(
                     select(
                         func.count(Campaign.id),
                         func.sum(case((Campaign.is_active.is_(True), 1), else_=0)),
-                    ).where(Campaign.chat_id.is_not(None))
+                    ).where(Campaign.kind == CAMPAIGN)
                 )
             ).one()
             return int(row[0] or 0), int(row[1] or 0)
+
+    # ------------------------------------------------------------ чаты рассылки
+
+    async def _targets(self, s: AsyncSession, campaign_ids: Collection[int]) -> dict[int, list[Target]]:
+        result: dict[int, list[Target]] = {cid: [] for cid in campaign_ids}
+        if not result:
+            return result
+        rows = await s.execute(
+            select(CampaignChat, Chat)
+            .join(Chat, Chat.id == CampaignChat.chat_id)
+            .where(CampaignChat.campaign_id.in_(list(result)))
+        )
+        for link, chat in rows.all():
+            result[link.campaign_id].append(Target(link=link, chat=chat))
+        for targets in result.values():
+            targets.sort(key=lambda target: chat_sort_key(target.chat))
+        return result
+
+    async def campaign_targets(self, campaign_id: int) -> list[Target]:
+        async with self.db.session() as s:
+            return (await self._targets(s, [campaign_id]))[campaign_id]
+
+    async def targets_of(self, campaign_ids: Iterable[int]) -> dict[int, list[Target]]:
+        async with self.db.session() as s:
+            return await self._targets(s, list(dict.fromkeys(campaign_ids)))
+
+    async def chat_links(self, chat_id: int) -> dict[int, CampaignChat]:
+        """campaign_id -> отметка этого чата в рассылке."""
+        async with self.db.session() as s:
+            rows = await s.scalars(select(CampaignChat).where(CampaignChat.chat_id == chat_id))
+            return {link.campaign_id: link for link in rows.all()}
+
+    async def set_target(self, campaign_id: int, chat_id: int, on: bool) -> bool:
+        """Отмечает чат в рассылке или снимает отметку. Возвращает, изменилось ли что-то."""
+        async with self.db.session() as s:
+            link = await s.scalar(
+                select(CampaignChat).where(CampaignChat.campaign_id == campaign_id, CampaignChat.chat_id == chat_id)
+            )
+            if on and link is None:
+                if await s.get(Campaign, campaign_id) is None or await s.get(Chat, chat_id) is None:
+                    return False
+                s.add(CampaignChat(campaign_id=campaign_id, chat_id=chat_id))
+            elif not on and link is not None:
+                await s.delete(link)
+            else:
+                return False
+            await s.commit()
+            return True
+
+    async def add_targets(self, campaign_id: int, chat_ids: Iterable[int]) -> int:
+        """Отмечает чаты в дополнение к уже отмеченным. Возвращает, сколько добавлено."""
+        async with self.db.session() as s:
+            if await s.get(Campaign, campaign_id) is None:
+                return 0
+            added = await self._add_targets(s, campaign_id, chat_ids)
+            await s.commit()
+            return added
+
+    async def _add_targets(self, s: AsyncSession, campaign_id: int, chat_ids: Iterable[int]) -> int:
+        existing = set(await s.scalars(select(CampaignChat.chat_id).where(CampaignChat.campaign_id == campaign_id)))
+        added = 0
+        for chat_id in dict.fromkeys(chat_ids):
+            if chat_id not in existing:
+                s.add(CampaignChat(campaign_id=campaign_id, chat_id=chat_id))
+                added += 1
+        return added
+
+    async def clear_targets(self, campaign_id: int) -> int:
+        async with self.db.session() as s:
+            result = await s.execute(delete(CampaignChat).where(CampaignChat.campaign_id == campaign_id))
+            await s.commit()
+            return int(result.rowcount or 0)
+
+    async def update_target(self, campaign_id: int, chat_id: int, **values: Any) -> CampaignChat | None:
+        async with self.db.session() as s:
+            link = await s.scalar(
+                select(CampaignChat).where(CampaignChat.campaign_id == campaign_id, CampaignChat.chat_id == chat_id)
+            )
+            if link is None:
+                return None
+            for key, value in values.items():
+                setattr(link, key, value)
+            await s.commit()
+            return link
+
+    async def resume_target(self, campaign_id: int, chat_id: int) -> CampaignChat | None:
+        """Снимает паузу, поставленную после серии ошибок."""
+        return await self.update_target(campaign_id, chat_id, paused=False, fail_count=0, last_error=None)
+
+    async def resume_chat_targets(self, chat_id: int) -> int:
+        """Снимает паузу после ошибок во всех рассылках этого чата."""
+        async with self.db.session() as s:
+            result = await s.execute(
+                update(CampaignChat)
+                .where(CampaignChat.chat_id == chat_id, CampaignChat.paused.is_(True))
+                .values(paused=False, fail_count=0, last_error=None)
+            )
+            await s.commit()
+            return int(result.rowcount or 0)
+
+    # ------------------------------------------------------------------ черновики
 
     async def _copy_template(self, s: AsyncSession, src: Campaign, dst: Campaign, posts: Sequence[Post]) -> None:
         for field in TEMPLATE_FIELDS:
             setattr(dst, field, copy.deepcopy(getattr(src, field)))
         await s.execute(delete(Post).where(Post.campaign_id == dst.id))
-        for post in posts:
-            s.add(Post(campaign_id=dst.id, **{f: copy.deepcopy(getattr(post, f)) for f in POST_FIELDS}))
+        for position, post in enumerate(posts):
+            s.add(_copy_post(post, dst.id, position))
         dst.last_post_id = None
         dst.updated_ts = now_ts()
 
     async def _posts_of(self, s: AsyncSession, campaign_id: int) -> list[Post]:
         rows = await s.scalars(select(Post).where(Post.campaign_id == campaign_id).order_by(Post.position, Post.id))
         return list(rows.all())
-
-    def _blank(self, chat_id: int | None, name: str) -> Campaign:
-        return Campaign(
-            chat_id=chat_id,
-            name=_clip_name(name),
-            is_active=False,
-            last_message_ids=[],
-            sent_count=0,
-            fail_count=0,
-        )
 
     async def save_as_draft(self, campaign_id: int, name: str | None = None) -> Campaign | None:
         """Копирует рассылку в новый черновик и связывает исходную рассылку с ним."""
@@ -382,60 +504,70 @@ class Repo:
             if src is None:
                 return None
             posts = await self._posts_of(s, src.id)
-            draft = self._blank(None, name or src.name)
+            draft = _blank(name or src.name, DRAFT)
             s.add(draft)
             await s.flush()
             await self._copy_template(s, src, draft, posts)
-            if src.chat_id is not None:
+            if src.kind == CAMPAIGN:
                 src.source_draft_id = draft.id
             await s.commit()
             return draft
 
-    async def apply_template(
-        self,
-        src_id: int,
-        chat_ids: Sequence[int],
-        *,
-        activate: bool | None,
-        link: bool,
-    ) -> list[tuple[Campaign, bool]]:
-        """Копирует рассылку/черновик в чаты.
+    async def apply_draft(
+        self, draft_id: int, chat_ids: Iterable[int], *, activate: bool
+    ) -> tuple[Campaign, bool] | None:
+        """Черновик → связанная с ним рассылка. При первом применении она создаётся, при повторном —
+        получает посты, расписание и опции черновика. Отмеченные чаты добавляются к уже выбранным.
 
-        link=True (черновик): upsert по (чат, source_draft_id) — повторное применение
-        обновляет уже созданную рассылку, а не плодит дубли.
-        activate=None — не менять статус (используется при «Обновить во всех»).
-        Возвращает [(рассылка, создана_ли_новая)].
+        activate=True запускает рассылку; иначе новая создаётся остановленной, а у существующей
+        статус не меняется. Возвращает (рассылка, создана ли новая); None — черновика нет.
         """
-        results: list[tuple[Campaign, bool]] = []
         async with self.db.session() as s:
-            src = await s.get(Campaign, src_id)
-            if src is None:
-                return results
-            posts = await self._posts_of(s, src.id)
-            for chat_id in chat_ids:
-                dst: Campaign | None = None
-                if link:
-                    dst = await s.scalar(
-                        select(Campaign)
-                        .where(Campaign.chat_id == chat_id, Campaign.source_draft_id == src.id)
-                        .order_by(Campaign.id)
-                        .limit(1)
-                    )
-                created = dst is None
-                if dst is None:
-                    dst = self._blank(chat_id, src.name)
-                    dst.source_draft_id = src.id if link else None
-                    s.add(dst)
-                    await s.flush()
-                await self._copy_template(s, src, dst, posts)
-                if activate is not None:
-                    dst.is_active = activate
-                    if not activate:
-                        dst.next_slot_ts = dst.next_run_ts = None
-                dst.fail_count = 0
-                results.append((dst, created))
+            draft = await s.get(Campaign, draft_id)
+            if draft is None or draft.kind != DRAFT:
+                return None
+            posts = await self._posts_of(s, draft.id)
+            dst = await s.scalar(
+                select(Campaign)
+                .where(Campaign.source_draft_id == draft.id, Campaign.kind == CAMPAIGN)
+                .order_by(Campaign.id)
+                .limit(1)
+            )
+            created = dst is None
+            if dst is None:
+                dst = _blank(draft.name, CAMPAIGN)
+                dst.source_draft_id = draft.id
+                s.add(dst)
+                await s.flush()
+            await self._copy_template(s, draft, dst, posts)
+            await self._add_targets(s, dst.id, chat_ids)
+            if activate:
+                dst.is_active = True
+                dst.last_error = None
             await s.commit()
-        return results
+            return dst, created
+
+    async def sync_draft(self, draft_id: int) -> list[Campaign]:
+        """«Обновить рассылки»: посты, расписание и опции черновика переносятся во все связанные
+        рассылки. Чаты и статус рассылок не меняются."""
+        async with self.db.session() as s:
+            draft = await s.get(Campaign, draft_id)
+            if draft is None or draft.kind != DRAFT:
+                return []
+            posts = await self._posts_of(s, draft.id)
+            linked = list(
+                (
+                    await s.scalars(
+                        select(Campaign)
+                        .where(Campaign.source_draft_id == draft.id, Campaign.kind == CAMPAIGN)
+                        .order_by(Campaign.id)
+                    )
+                ).all()
+            )
+            for dst in linked:
+                await self._copy_template(s, draft, dst, posts)
+            await s.commit()
+            return linked
 
     # --------------------------------------------------------------------- posts
 
@@ -459,6 +591,14 @@ class Repo:
             )
             return {int(cid): int(count) for cid, count in rows}
 
+    async def _append(self, s: AsyncSession, post: Post) -> int:
+        """Ставит пост в конец рассылки. Возвращает его номер."""
+        max_pos = await s.scalar(select(func.max(Post.position)).where(Post.campaign_id == post.campaign_id))
+        post.position = (max_pos + 1) if max_pos is not None else 0
+        s.add(post)
+        await s.flush()
+        return int(await s.scalar(select(func.count(Post.id)).where(Post.campaign_id == post.campaign_id)) or 0)
+
     async def add_post(
         self,
         campaign_id: int,
@@ -470,19 +610,15 @@ class Repo:
     ) -> tuple[Post, int]:
         """Добавляет пост в конец. Возвращает (пост, его номер в рассылке)."""
         async with self.db.session() as s:
-            max_pos = await s.scalar(select(func.max(Post.position)).where(Post.campaign_id == campaign_id))
             post = Post(
                 campaign_id=campaign_id,
-                position=(max_pos + 1) if max_pos is not None else 0,
                 kind=kind,
                 payload=payload,
                 buttons=buttons,
                 forward_from=forward_from,
                 send_mode="copy",
             )
-            s.add(post)
-            await s.flush()
-            number = int(await s.scalar(select(func.count(Post.id)).where(Post.campaign_id == campaign_id)) or 0)
+            number = await self._append(s, post)
             await s.commit()
             return post, number
 
@@ -526,6 +662,48 @@ class Repo:
             await s.commit()
             return True
 
+    # ------------------------------------------------------------- «Мои посты»
+
+    async def list_all_posts(self, offset: int = 0, limit: int = 10) -> list[tuple[Post, Campaign]]:
+        """Посты всех рассылок и черновиков, новые — первыми."""
+        async with self.db.session() as s:
+            rows = await s.execute(
+                select(Post, Campaign)
+                .join(Campaign, Campaign.id == Post.campaign_id)
+                .order_by(Post.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            return [(post, campaign) for post, campaign in rows.all()]
+
+    async def count_posts_total(self) -> int:
+        async with self.db.session() as s:
+            return int(await s.scalar(select(func.count(Post.id))) or 0)
+
+    async def copy_post(self, post_id: int, campaign_id: int) -> tuple[Post, int] | None:
+        """Копия поста в конец другой рассылки или черновика. Возвращает (копия, её номер)."""
+        async with self.db.session() as s:
+            src = await s.get(Post, post_id)
+            if src is None or await s.get(Campaign, campaign_id) is None:
+                return None
+            post = _copy_post(src, campaign_id, 0)
+            number = await self._append(s, post)
+            await s.commit()
+            return post, number
+
+    async def campaign_from_post(self, post_id: int, name: str) -> Campaign | None:
+        """Новая остановленная рассылка без чатов с копией поста."""
+        async with self.db.session() as s:
+            src = await s.get(Post, post_id)
+            if src is None:
+                return None
+            campaign = _blank(name, CAMPAIGN)
+            s.add(campaign)
+            await s.flush()
+            s.add(_copy_post(src, campaign.id, 0))
+            await s.commit()
+            return campaign
+
     # ----------------------------------------------------------------- scheduler
 
     async def due_runs(self, now: int) -> list[tuple[int, int]]:
@@ -533,12 +711,11 @@ class Repo:
         async with self.db.session() as s:
             rows = await s.execute(
                 select(Campaign.id, Campaign.next_run_ts)
-                .join(Chat, Chat.id == Campaign.chat_id)
                 .where(
+                    Campaign.kind == CAMPAIGN,
                     Campaign.is_active.is_(True),
                     Campaign.next_run_ts.is_not(None),
                     Campaign.next_run_ts <= now,
-                    Chat.status == "active",
                 )
                 .order_by(Campaign.next_run_ts)
             )
@@ -555,20 +732,20 @@ class Repo:
 
         UPDATE ... WHERE next_run_ts = :expected гарантирует, что один слот не будет
         отправлен дважды — ни параллельной задачей, ни после падения процесса.
+        Если публиковать некуда (все чаты недоступны), слот всё равно проходит — без отправки
+        и без смены очереди постов.
         """
         async with self.db.session() as s:
             campaign = await s.get(Campaign, campaign_id)
             if (
                 campaign is None
+                or campaign.kind != CAMPAIGN
                 or not campaign.is_active
-                or campaign.chat_id is None
                 or campaign.next_run_ts != expected_run_ts
             ):
                 return None
-            chat = await s.get(Chat, campaign.chat_id)
-            if chat is None or chat.status != "active":
-                return None
             posts = await self._posts_of(s, campaign.id)
+            targets = [t for t in (await self._targets(s, [campaign.id]))[campaign.id] if t.deliverable]
             decision = decide(campaign, posts)
             values: dict[str, Any] = {
                 "next_slot_ts": decision.next_slot_ts,
@@ -576,7 +753,7 @@ class Repo:
                 "last_slot_ts": campaign.next_slot_ts,
                 "updated_ts": now,
             }
-            if decision.post is not None:
+            if decision.post is not None and targets:
                 values["last_post_id"] = decision.post.id
             if decision.finished:
                 values["is_active"] = False
@@ -589,25 +766,27 @@ class Repo:
             if result.rowcount != 1:
                 await s.rollback()
                 return None
+            skip_reason = None
             if decision.skipped:
-                s.add(
-                    SendLog(
-                        campaign_id=campaign.id,
-                        chat_id=chat.id,
-                        status="skipped",
-                        error="Слот пропущен: бот был недоступен дольше допустимого",
-                        ts=now,
-                    )
-                )
+                skip_reason = "Слот пропущен: бот был недоступен дольше допустимого"
+            elif decision.post is not None and not targets:
+                skip_reason = "Слот пропущен: нет чатов, куда бот может публиковать"
+            if skip_reason:
+                s.add(SendLog(campaign_id=campaign.id, status="skipped", error=skip_reason, ts=now))
             await s.commit()
-            return Claim(campaign=campaign, chat=chat, decision=decision)
+            return Claim(campaign=campaign, targets=targets, decision=decision)
 
     async def mark_post_used(self, campaign_id: int, post_id: int) -> None:
         async with self.db.session() as s:
             await s.execute(update(Campaign).where(Campaign.id == campaign_id).values(last_post_id=post_id))
             await s.commit()
 
-    async def record_sent(
+    async def _link(self, s: AsyncSession, campaign_id: int, chat_id: int) -> CampaignChat | None:
+        return await s.scalar(
+            select(CampaignChat).where(CampaignChat.campaign_id == campaign_id, CampaignChat.chat_id == chat_id)
+        )
+
+    async def record_target_sent(
         self,
         campaign_id: int,
         chat_id: int,
@@ -619,13 +798,13 @@ class Repo:
         warning: str | None = None,
     ) -> None:
         async with self.db.session() as s:
-            campaign = await s.get(Campaign, campaign_id)
-            if campaign is not None:
-                campaign.last_message_ids = list(message_ids)
-                campaign.last_sent_ts = now
-                campaign.sent_count = (campaign.sent_count or 0) + 1
-                campaign.fail_count = 0
-                campaign.last_error = warning
+            link = await self._link(s, campaign_id, chat_id)
+            if link is not None:  # чат могли снять с рассылки, пока шла отправка
+                link.last_message_ids = list(message_ids)
+                link.last_sent_ts = now
+                link.sent_count = (link.sent_count or 0) + 1
+                link.fail_count = 0
+                link.last_error = warning
             s.add(
                 SendLog(
                     campaign_id=campaign_id,
@@ -640,29 +819,28 @@ class Repo:
             )
             await s.commit()
 
-    async def record_failed(
+    async def record_target_failed(
         self,
         campaign_id: int,
-        chat_id: int | None,
+        chat_id: int,
         post_id: int | None,
         error: str,
         *,
         manual: bool,
         now: int,
-        max_fails: int,
+        max_fails: int | None,
     ) -> tuple[int, bool]:
-        """Возвращает (ошибок подряд, поставлена ли рассылка на автопаузу)."""
+        """Возвращает (ошибок подряд в этом чате, поставлен ли чат рассылки на паузу сейчас).
+        max_fails=None — не ставить на паузу (например, бота удалили из чата)."""
         async with self.db.session() as s:
-            campaign = await s.get(Campaign, campaign_id)
+            link = await self._link(s, campaign_id, chat_id)
             fails, paused = 0, False
-            if campaign is not None:
-                fails = (campaign.fail_count or 0) + 1
-                campaign.fail_count = fails
-                campaign.last_error = error[:1000]
-                if not manual and fails >= max_fails and campaign.is_active:
-                    campaign.is_active = False
-                    campaign.next_slot_ts = campaign.next_run_ts = None
-                    paused = True
+            if link is not None:
+                fails = (link.fail_count or 0) + 1
+                link.fail_count = fails
+                link.last_error = error[:1000]
+                if not manual and max_fails is not None and fails >= max_fails and not link.paused:
+                    link.paused = paused = True
             s.add(
                 SendLog(
                     campaign_id=campaign_id,
@@ -677,6 +855,17 @@ class Repo:
             await s.commit()
             return fails, paused
 
+    async def stop_campaign(self, campaign_id: int, error: str, *, now: int) -> None:
+        """Останавливает рассылку из-за её собственной проблемы (например, не осталось постов)."""
+        async with self.db.session() as s:
+            await s.execute(
+                update(Campaign)
+                .where(Campaign.id == campaign_id)
+                .values(is_active=False, next_slot_ts=None, next_run_ts=None, last_error=error[:1000], updated_ts=now)
+            )
+            s.add(SendLog(campaign_id=campaign_id, status="failed", error=error[:1000], ts=now))
+            await s.commit()
+
     async def reschedule(
         self,
         planner: Callable[[Campaign], tuple[int | None, int | None]],
@@ -689,7 +878,7 @@ class Repo:
         расписания не выключает её молча. Возвращает такие рассылки."""
         stalled: list[Campaign] = []
         async with self.db.session() as s:
-            query = select(Campaign).where(Campaign.chat_id.is_not(None))
+            query = select(Campaign).where(Campaign.kind == CAMPAIGN)
             if campaign_ids is not None:
                 ids = list(campaign_ids)
                 if not ids:

@@ -1,7 +1,8 @@
 """Модели базы данных.
 
 Время везде хранится как UTC epoch-секунды (INTEGER): SQLite не хранит часовые пояса.
-Рассылки и черновики живут в одной таблице: у черновика ``chat_id`` пустой.
+Рассылки и черновики живут в одной таблице (поле ``kind``). Одна рассылка публикуется
+в несколько чатов: связь и состояние отправки по каждому чату — в таблице ``campaign_chats``.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, BigInteger, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ALL_WEEKDAYS = [0, 1, 2, 3, 4, 5, 6]
@@ -46,6 +47,9 @@ class Campaign(Base):
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "campaign" — рассылка, "draft" — черновик. NULL бывает только в базах до миграции v2.
+    kind: Mapped[str | None] = mapped_column(String(8), default="campaign")
+    # Устарело: до v2 рассылка принадлежала одному чату. Теперь всегда NULL — чаты в campaign_chats.
     chat_id: Mapped[int | None] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True, default=None)
     source_draft_id: Mapped[int | None] = mapped_column(
         ForeignKey("campaigns.id", ondelete="SET NULL"), index=True, default=None
@@ -66,7 +70,7 @@ class Campaign(Base):
     protect: Mapped[bool] = mapped_column(default=False)
     pin: Mapped[bool] = mapped_column(default=False)
     delete_prev: Mapped[bool] = mapped_column(default=False)
-    thread_id: Mapped[int | None] = mapped_column(default=None)
+    thread_id: Mapped[int | None] = mapped_column(default=None)  # устарело: тема теперь у каждого чата своя
 
     # Состояние
     next_slot_ts: Mapped[int | None] = mapped_column(default=None)
@@ -74,18 +78,40 @@ class Campaign(Base):
     last_slot_ts: Mapped[int | None] = mapped_column(default=None)
     next_run_ts: Mapped[int | None] = mapped_column(default=None, index=True)
     last_post_id: Mapped[int | None] = mapped_column(default=None)
+    # Проблемы уровня рассылки (например, «нет постов»); ошибки отправки — у каждого чата свои
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Устарело (до v2 — состояние единственного чата), перенесено в campaign_chats
     last_message_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     last_sent_ts: Mapped[int | None] = mapped_column(default=None)
     sent_count: Mapped[int] = mapped_column(default=0)
     fail_count: Mapped[int] = mapped_column(default=0)
-    last_error: Mapped[str | None] = mapped_column(Text, default=None)
 
     created_ts: Mapped[int] = mapped_column(default=now_ts)
     updated_ts: Mapped[int] = mapped_column(default=now_ts, onupdate=now_ts)
 
     @property
     def is_draft(self) -> bool:
-        return self.chat_id is None
+        return self.kind == "draft"
+
+
+class CampaignChat(Base):
+    """Чат, в который публикуется рассылка, и состояние отправки именно в него."""
+
+    __tablename__ = "campaign_chats"
+    __table_args__ = (UniqueConstraint("campaign_id", "chat_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True)
+    thread_id: Mapped[int | None] = mapped_column(default=None)  # тема форума в этом чате
+    last_message_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    last_sent_ts: Mapped[int | None] = mapped_column(default=None)
+    sent_count: Mapped[int] = mapped_column(default=0)
+    fail_count: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Автопауза после серии ошибок в этом чате (остальные чаты рассылки работают)
+    paused: Mapped[bool] = mapped_column(default=False)
+    created_ts: Mapped[int] = mapped_column(default=now_ts)
 
 
 class Post(Base):

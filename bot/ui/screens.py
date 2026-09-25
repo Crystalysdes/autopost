@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -11,9 +12,11 @@ from zoneinfo import ZoneInfo
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.app import App
-from bot.db.models import Campaign, Chat, Post, now_ts
+from bot.db.models import Campaign, Post, now_ts
+from bot.db.repo import Target
 from bot.services import schedule_utils as su
 from bot.services.buttons import buttons_to_html, count_buttons, has_icons
+from bot.services.campaigns import target_problem
 from bot.services.content import custom_emoji_count, post_text, post_title, supports_buttons
 from bot.services.scheduler import predict_runs, spec_of
 from bot.ui import texts as t
@@ -21,12 +24,14 @@ from bot.ui.callbacks import (
     ApplyDraft,
     CampAct,
     ChatAct,
+    LibAct,
     Nav,
     OptAct,
     PickAct,
     PostAct,
     SchedAct,
     SetAct,
+    TargetAct,
 )
 from bot.ui.keyboards import BLUE, GREEN, RED, add_channel_link, add_group_link, back, btn, markup, url_btn
 
@@ -34,7 +39,9 @@ Screen = tuple[str, InlineKeyboardMarkup]
 
 PAGE_SIZE = 8
 POSTS_PAGE_SIZE = 10
+TARGETS_PAGE_SIZE = 10
 MAX_LIST_BUTTONS = 40  # длинные списки режем, чтобы не упереться в лимиты Telegram
+MAX_PROBLEM_LINES = 8
 COUNT_CHOICES = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24)
 WINDOWS = ((540, 1260), (600, 1320), (480, 1380), (720, 1200), (0, 0))
 TIMEZONES = (
@@ -68,8 +75,8 @@ def _now(app: App) -> int:
     return app.scheduler.now() if app.scheduler else now_ts()
 
 
-def _pages(total: int, page: int) -> tuple[int, int]:
-    pages = max(1, math.ceil(total / PAGE_SIZE))
+def _pages(total: int, page: int, size: int = PAGE_SIZE) -> tuple[int, int]:
+    pages = max(1, math.ceil(total / size))
     return pages, min(max(page, 0), pages - 1)
 
 
@@ -91,6 +98,10 @@ def _next_jitter(current: int) -> int:
     return steps[(index + 1) % len(steps)]
 
 
+def _chats_word(count: int) -> str:
+    return f"{count} {t.plural(count, 'чат', 'чата', 'чатов')}"
+
+
 def window_label(window: tuple[int, int]) -> str:
     start, end = window
     if start == end:
@@ -109,7 +120,7 @@ async def main_menu(app: App) -> Screen:
     pending = sum(1 for c in chats if c.status == "pending")
     total, active = await app.repo.campaign_totals()
     counts = await app.repo.log_counts_since(t.day_start_ts(tz, now))
-    upcoming = [(c, chat) for c, chat in await app.repo.active_campaigns_with_chats() if c.next_run_ts]
+    upcoming = [c for c in await app.repo.active_campaigns() if c.next_run_ts]
 
     lines = ["<b>🤖 Автопостинг</b>", ""]
     chat_line = f"💬 Чатов: <b>{active_chats}</b>"
@@ -122,8 +133,8 @@ async def main_menu(app: App) -> Screen:
         sent_line += f" · ошибок: {counts['failed']}"
     lines.append(sent_line)
     if upcoming and not app.settings.paused_all:
-        campaign, chat = upcoming[0]
-        lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · {t.esc(chat.title, 30)}")
+        campaign = upcoming[0]
+        lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · «{t.esc(campaign.name, 30)}»")
     if app.settings.paused_all:
         lines += ["", "⏸ <b>Все рассылки на паузе.</b> Возобновить — в настройках."]
     if not chats:
@@ -133,7 +144,8 @@ async def main_menu(app: App) -> Screen:
             "или в разделе «Мои чаты». Чат сразу появится здесь.",
         ]
     keyboard = markup(
-        [btn("💬 Мои чаты", Nav(to="chats"), BLUE), btn("📝 Черновики", Nav(to="drafts"))],
+        [btn("💬 Мои чаты", Nav(to="chats"), BLUE), btn("📬 Рассылки", Nav(to="camps"), BLUE)],
+        [btn("🗂 Мои посты", Nav(to="lib")), btn("📝 Черновики", Nav(to="drafts"))],
         [btn("📅 Ближайшие публикации", Nav(to="upcoming"))],
         [btn("⚙️ Настройки", Nav(to="settings")), btn("❓ Помощь", Nav(to="help"))],
     )
@@ -143,7 +155,7 @@ async def main_menu(app: App) -> Screen:
 # --------------------------------------------------------------------------- чаты
 
 
-def chat_icon(chat: Chat, stats: tuple[int, int] | None) -> str:
+def chat_icon(chat: Any, stats: tuple[int, int] | None) -> str:
     if chat.status == "pending":
         return "⏳"
     if chat.status == "left":
@@ -197,6 +209,8 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
     if chat is None:
         return None
     campaigns = await app.repo.list_campaigns(chat.id)
+    links = await app.repo.chat_links(chat.id)
+    paused_links = sum(1 for link in links.values() if link.paused)
     type_icon = t.CHAT_ICONS.get(chat.type, "💬")
     subtitle = t.chat_kind(chat.type)
     if chat.username:
@@ -209,8 +223,8 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
         lines.append("⏳ <b>Бота добавил не админ.</b> Примите чат, чтобы публиковать в нём, или выйдите из него.")
     elif chat.status == "left":
         lines.append(
-            "🚫 <b>Бота нет в этом чате</b> — его удалили или лишили прав. "
-            "Добавьте бота снова администратором: рассылки и настройки сохранятся."
+            "🚫 <b>Бота нет в этом чате</b> — его удалили или лишили прав, рассылки пропускают этот чат. "
+            "Добавьте бота снова администратором — публикации возобновятся сами."
         )
     else:
         post_mark = "✅" if chat.can_post else "❌"
@@ -220,11 +234,16 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
             lines.append("⚠️ Бот не может публиковать здесь — выдайте ему право «Публикация сообщений».")
     lines.append("")
     if campaigns:
-        lines.append(f"📬 Рассылок: <b>{len(campaigns)}</b>")
+        lines.append(f"📬 Рассылок с этим чатом: <b>{len(campaigns)}</b>")
+        if paused_links:
+            lines.append(f"⏸ В {paused_links} из них публикации сюда на паузе после ошибок.")
         if len(campaigns) > MAX_LIST_BUTTONS:
             lines.append(f"Показаны первые {MAX_LIST_BUTTONS}.")
     else:
-        lines.append("Рассылок пока нет — создайте первую или примените черновик.")
+        lines.append(
+            "Этот чат пока не отмечен ни в одной рассылке. Создайте новую, примените черновик "
+            "или отметьте чат в любой рассылке кнопкой «💬 Чаты»."
+        )
 
     rows: list[list[InlineKeyboardButton] | None] = []
     if chat.status == "pending":
@@ -235,12 +254,18 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
             ]
         )
     for campaign in campaigns[:MAX_LIST_BUTTONS]:
-        icon = "🟢" if campaign.is_active else "⏸"
+        link = links.get(campaign.id)
+        if not campaign.is_active:
+            icon = "⏸"
+        elif link is not None and link.paused:
+            icon = "⚠️"
+        else:
+            icon = "🟢"
         rows.append(
             [
                 btn(
                     f"{icon} {t.cut(campaign.name, 32)} · {t.times_short(campaign.times)}",
-                    Nav(to="camp", id=campaign.id),
+                    Nav(to="camp", id=campaign.id, f=chat.id),
                 )
             ]
         )
@@ -250,8 +275,8 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
             btn("📝 Из черновика", ChatAct(a="fromdraft", id=chat.id)),
         ]
     )
-    if chat.status == "active" and any(not c.is_active for c in campaigns):
-        rows.append([btn("▶️ Запустить все на паузе", ChatAct(a="resume", id=chat.id))])
+    if paused_links:
+        rows.append([btn(f"▶️ Возобновить публикации сюда ({paused_links})", ChatAct(a="resume", id=chat.id), GREEN)])
     rows.append(
         [
             btn("🔄 Обновить права", ChatAct(a="refresh", id=chat.id)),
@@ -267,9 +292,13 @@ async def chat_delete_confirm(app: App, chat_id: int) -> Screen | None:
     if chat is None:
         return None
     count = await app.repo.count_campaigns(chat.id)
-    text = (
-        f"🗑 Удалить «<b>{t.esc(chat.title)}</b>» из бота?\n\n"
-        f"Вместе с ним удалятся рассылки этого чата: {count}. Черновики не пострадают.\n\n"
+    text = f"🗑 Удалить «<b>{t.esc(chat.title)}</b>» из бота?\n\n"
+    if count:
+        text += (
+            f"Чат будет убран из рассылок: {count}. Сами рассылки, их посты и черновики останутся "
+            "и продолжат публиковать в другие чаты.\n\n"
+        )
+    text += (
         "• <b>Удалить и выйти</b> — бот покинет чат.\n"
         "• <b>Только удалить</b> — бот останется в чате, но пропадёт из списка "
         "(вернуть можно кнопкой «➕ Добавить…»)."
@@ -291,8 +320,9 @@ async def drafts_for_chat(app: App, chat_id: int) -> Screen | None:
     lines = [f"<b>📝 Применить черновик к «{t.esc(chat.title)}»</b>", ""]
     if drafts:
         lines.append(
-            "Выберите черновик. В чате появится рассылка с его постами, расписанием и опциями "
-            "(на паузе — проверьте и запустите). Если черновик тут уже применялся, рассылка обновится."
+            "Выберите черновик. Этот чат добавится в рассылку, созданную из черновика (если её ещё нет — "
+            "она появится остановленной: проверьте и запустите). Посты, расписание и опции рассылки "
+            "возьмутся из черновика."
         )
     else:
         lines.append(
@@ -317,13 +347,51 @@ async def drafts_for_chat(app: App, chat_id: int) -> Screen | None:
 # ----------------------------------------------------------------------- рассылки
 
 
-def _status_line(campaign: Campaign, chat: Chat | None, paused_all: bool) -> str:
-    if chat is None or chat.status != "active":
-        return "🚫 чат недоступен"
+def campaign_icon(campaign: Campaign, targets: Sequence[Target]) -> str:
+    if not campaign.is_active:
+        return "⏸"
+    if not any(target.deliverable for target in targets) or any(target_problem(target) for target in targets):
+        return "⚠️"
+    return "🟢"
+
+
+async def campaigns_list(app: App, page: int = 0) -> Screen:
+    campaigns = await app.repo.list_campaigns()
+    pages, page = _pages(len(campaigns), page)
+    shown = campaigns[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    targets = await app.repo.targets_of(c.id for c in shown)
+    lines = ["<b>📬 Рассылки</b>", ""]
+    if campaigns:
+        lines.append(
+            "Рассылка публикует свои посты по своему расписанию во все отмеченные в ней чаты.\n\n"
+            "🟢 работает · ⏸ остановлена · ⚠️ требует внимания"
+        )
+    else:
+        lines.append(
+            "Рассылок пока нет. Рассылка публикует посты по расписанию во все отмеченные в ней чаты — "
+            "создайте первую: отметьте чаты, добавьте посты и задайте время."
+        )
+    rows: list[list[InlineKeyboardButton] | None] = []
+    for campaign in shown:
+        items = targets.get(campaign.id, [])
+        label = (
+            f"{campaign_icon(campaign, items)} {t.cut(campaign.name, 26)} · {_chats_word(len(items))} · "
+            f"{t.times_short(campaign.times)}"
+        )
+        rows.append([btn(label, Nav(to="camp", id=campaign.id, f=-1))])
+    rows.append(_pager(page, pages, lambda p: Nav(to="camps", page=p)))
+    rows.append([btn("➕ Новая рассылка", CampAct(a="new", id=0), GREEN)])
+    rows.append(back("main", text="« Меню"))
+    return "\n".join(lines), markup(*rows)
+
+
+def _status_line(campaign: Campaign, targets: Sequence[Target], paused_all: bool) -> str:
     if not campaign.is_active:
         return "⏸ остановлена"
     if paused_all:
         return "⏸ все рассылки на паузе (см. настройки)"
+    if not any(target.deliverable for target in targets):
+        return "⚠️ запущена, но публиковать некуда — проверьте «💬 Чаты»"
     if campaign.next_run_ts is None:
         return "⚠️ включена, но ближайших публикаций нет — проверьте время, дни и период"
     return "🟢 работает"
@@ -337,9 +405,29 @@ def _uses_premium(posts: list[Post]) -> bool:
     )
 
 
-def campaign_warnings(campaign: Campaign, chat: Chat | None, posts: list[Post], tz: Any, now: int) -> list[str]:
+def target_lines(targets: Sequence[Target]) -> list[str]:
+    """Что не так с чатами рассылки: бота нет, нет прав, пауза после ошибок, свежие ошибки."""
+    lines = []
+    for target in targets:
+        title, link = t.esc(target.chat.title, 30), target.link
+        problem = target_problem(target)
+        if link.paused:
+            reason = f": <i>{t.esc(link.last_error, 150)}</i>" if link.last_error else ""
+            lines.append(f"⏸ «{title}» — пауза после ошибок{reason}")
+        elif problem:
+            lines.append(f"⚠️ «{title}» — {problem}")
+        elif link.fail_count and link.last_error:
+            lines.append(f"⚠️ «{title}» — ошибок подряд: {link.fail_count}, <i>{t.esc(link.last_error, 150)}</i>")
+        elif link.last_error:
+            lines.append(f"ℹ️ «{title}» — {t.esc(link.last_error, 150)}")
+    if len(lines) > MAX_PROBLEM_LINES:
+        lines = [*lines[:MAX_PROBLEM_LINES], f"…и ещё {len(lines) - MAX_PROBLEM_LINES}"]
+    return lines
+
+
+def campaign_warnings(campaign: Campaign, targets: Sequence[Target], posts: list[Post], tz: Any, now: int) -> list[str]:
     warnings = []
-    if chat is not None and chat.type == "channel" and _uses_premium(posts):
+    if any(target.chat.type == "channel" for target in targets) and _uses_premium(posts):
         warnings.append(
             "💎 В постах есть премиум-эмодзи. В каналах бот показывает их, только если ему куплен юзернейм "
             "на Fragment — иначе они станут обычными. Альтернатива: переслать пост из своего канала "
@@ -347,31 +435,42 @@ def campaign_warnings(campaign: Campaign, chat: Chat | None, posts: list[Post], 
         )
     if campaign.delete_prev and su.max_gap_hours(campaign.times, campaign.weekdays) > 48:
         warnings.append("🗑 Между публикациями больше 48 часов — Telegram не даст удалить прошлый пост.")
-    if chat is not None and campaign.pin and not chat.can_pin:
-        warnings.append("📌 У бота нет права закреплять сообщения в этом чате.")
+    no_pin = [target.chat.title for target in targets if target.chat.status == "active" and not target.chat.can_pin]
+    if campaign.pin and no_pin:
+        warnings.append(f"📌 Нет права закреплять сообщения в: {t.names_label(no_pin, 5)}")
     if campaign.end_date and su.schedule_ended(spec_of(campaign), tz, now):
         warnings.append("📆 Период публикаций уже закончился.")
     return warnings
 
 
-async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> Screen | None:
+async def campaign_view(
+    app: App, campaign_id: int, note: str | None = None, *, user_id: int | None = None
+) -> Screen | None:
     campaign = await app.repo.get_campaign(campaign_id)
     if campaign is None:
         return None
     posts = await app.repo.list_posts(campaign.id)
-    chat = await app.repo.get_chat(campaign.chat_id) if campaign.chat_id else None
+    targets = [] if campaign.is_draft else await app.repo.campaign_targets(campaign.id)
     tz, now = app.settings.tz, _now(app)
     lines: list[str] = []
 
-    linked = len(await app.repo.linked_campaigns(campaign.id)) if campaign.is_draft else 0
+    linked = await app.repo.linked_campaigns(campaign.id) if campaign.is_draft else []
     if campaign.is_draft:
         lines.append(f"<b>📝 Черновик «{t.esc(campaign.name)}»</b>")
-        lines.append(f"Применён в чатах: {linked}" if linked else "Ещё не применён ни к одному чату")
+        if linked:
+            linked_targets = await app.repo.targets_of(c.id for c in linked)
+            parts = [f"«{t.esc(c.name, 30)}» ({_chats_word(len(linked_targets[c.id]))})" for c in linked[:3]]
+            more = f" и ещё {len(linked) - 3}" if len(linked) > 3 else ""
+            lines.append("📤 Применён: " + ", ".join(parts) + more)
+        else:
+            lines.append("Ещё не применён — «📤 Применить к чатам» создаст из него рассылку.")
     else:
         lines.append(f"<b>📬 Рассылка «{t.esc(campaign.name)}»</b>")
-        if chat is not None:
-            lines.append(f"{t.CHAT_ICONS.get(chat.type, '💬')} {t.esc(chat.title)}")
-        lines.append(f"Статус: {_status_line(campaign, chat, app.settings.paused_all)}")
+        if targets:
+            lines.append(f"💬 Чаты ({len(targets)}): {t.names_label([x.chat.title for x in targets])}")
+        else:
+            lines.append("💬 Чаты: <b>не выбраны</b>")
+        lines.append(f"Статус: {_status_line(campaign, targets, app.settings.paused_all)}")
     lines.append("")
 
     post_line = f"📝 Постов: <b>{len(posts)}</b>"
@@ -386,10 +485,7 @@ async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> 
     if campaign.start_date or campaign.end_date:
         day_line += f" · 📆 {t.period_label(campaign.start_date, campaign.end_date)}"
     lines.append(day_line)
-    lines.append(
-        "⚙️ "
-        + t.options_label(campaign.silent, campaign.protect, campaign.pin, campaign.delete_prev, campaign.thread_id)
-    )
+    lines.append("⚙️ " + t.options_label(campaign.silent, campaign.protect, campaign.pin, campaign.delete_prev))
 
     if not campaign.is_draft:
         predictions = predict_runs(campaign, posts, tz, 3)
@@ -401,25 +497,33 @@ async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> 
                     item += f" (#{number})"
                 parts.append(item)
             lines.append("⏭ Ближайшие: " + ", ".join(parts))
-        stats = f"📊 Опубликовано: {campaign.sent_count}"
-        if campaign.last_sent_ts:
-            stats += f" · последний {t.fmt_ts(campaign.last_sent_ts, tz, now)}"
-        lines.append(stats)
-        if campaign.fail_count:
-            lines.append(f"⚠️ Ошибок подряд: {campaign.fail_count}")
+        sent = sum(x.link.sent_count or 0 for x in targets)
+        last = max((x.link.last_sent_ts for x in targets if x.link.last_sent_ts), default=None)
+        if sent or targets:
+            stats = f"📊 Опубликовано: {sent}"
+            if last:
+                stats += f" · последний {t.fmt_ts(last, tz, now)}"
+            lines.append(stats)
         if campaign.last_error:
             lines.append(f"⚠️ <i>{t.esc(campaign.last_error, 300)}</i>")
+        problems = target_lines(targets)
+        if problems:
+            lines += ["", *problems]
+            if any(x.link.paused for x in targets):
+                lines.append("Возобновить публикации в чат — в «💬 Чаты».")
 
     missing = []
+    if not campaign.is_draft and not targets:
+        missing.append("отметьте чаты")
     if not posts:
         missing.append("добавьте посты")
     if not campaign.times:
         missing.append("задайте время")
     if not campaign.weekdays:
         missing.append("выберите дни")
-    if missing:
+    if missing and not campaign.is_active:
         lines += ["", "👉 Чтобы запустить: " + ", ".join(missing) + "."]
-    warnings = campaign_warnings(campaign, chat, posts, tz, now)
+    warnings = campaign_warnings(campaign, targets, posts, tz, now)
     if warnings:
         lines += ["", *warnings]
     if note:
@@ -428,7 +532,6 @@ async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> 
     cid = campaign.id
     rows: list[list[InlineKeyboardButton] | None] = []
     if campaign.is_draft:
-        linked_count = linked
         rows += [
             [
                 btn(f"📝 Посты ({len(posts)})", Nav(to="posts", id=cid)),
@@ -437,8 +540,8 @@ async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> 
             [btn("⚙️ Опции", Nav(to="opts", id=cid)), btn("👁 Предпросмотр", CampAct(a="preview", id=cid))],
             [btn("📤 Применить к чатам", CampAct(a="apply", id=cid), GREEN)],
         ]
-        if linked_count:
-            rows.append([btn(f"🔄 Обновить во всех ({linked_count})", CampAct(a="sync", id=cid))])
+        if linked:
+            rows.append([btn(f"🔄 Обновить рассылки ({len(linked)})", CampAct(a="sync", id=cid))])
         rows += [
             [
                 btn("✏️ Переименовать", CampAct(a="rename", id=cid)),
@@ -446,30 +549,33 @@ async def campaign_view(app: App, campaign_id: int, note: str | None = None) -> 
             ],
             back("drafts", text="« Черновики"),
         ]
+        return "\n".join(lines), markup(*rows)
+
+    toggle = (
+        btn("⏸ Остановить", CampAct(a="off", id=cid), RED)
+        if campaign.is_active
+        else btn("▶️ Запустить", CampAct(a="on", id=cid), GREEN)
+    )
+    origin = app.origin(user_id, cid)
+    if origin and await app.repo.get_chat(origin) is not None:
+        back_row = back("chat", origin, "« К чату")
     else:
-        toggle = (
-            btn("⏸ Остановить", CampAct(a="off", id=cid), RED)
-            if campaign.is_active
-            else btn("▶️ Запустить", CampAct(a="on", id=cid), GREEN)
-        )
-        rows += [
-            [toggle],
-            [
-                btn(f"📝 Посты ({len(posts)})", Nav(to="posts", id=cid)),
-                btn("⏰ Расписание", Nav(to="sched", id=cid)),
-            ],
-            [btn("⚙️ Опции", Nav(to="opts", id=cid)), btn("👁 Предпросмотр", CampAct(a="preview", id=cid))],
-            [btn("🚀 Отправить сейчас", CampAct(a="send", id=cid))],
-            [
-                btn("💾 В черновики", CampAct(a="todraft", id=cid)),
-                btn("📋 В другие чаты", CampAct(a="copy", id=cid)),
-            ],
-            [
-                btn("✏️ Переименовать", CampAct(a="rename", id=cid)),
-                btn("🗑 Удалить", CampAct(a="del", id=cid), RED),
-            ],
-            back("chat", campaign.chat_id or 0, "« К чату"),
-        ]
+        back_row = back("camps", text="« Рассылки")
+    rows += [
+        [toggle],
+        [btn(f"💬 Чаты ({len(targets)})", Nav(to="tgt", id=cid), BLUE)],
+        [
+            btn(f"📝 Посты ({len(posts)})", Nav(to="posts", id=cid)),
+            btn("⏰ Расписание", Nav(to="sched", id=cid)),
+        ],
+        [btn("⚙️ Опции", Nav(to="opts", id=cid)), btn("👁 Предпросмотр", CampAct(a="preview", id=cid))],
+        [btn("🚀 Отправить сейчас", CampAct(a="send", id=cid)), btn("💾 В черновики", CampAct(a="todraft", id=cid))],
+        [
+            btn("✏️ Переименовать", CampAct(a="rename", id=cid)),
+            btn("🗑 Удалить", CampAct(a="del", id=cid), RED),
+        ],
+        back_row,
+    ]
     return "\n".join(lines), markup(*rows)
 
 
@@ -481,6 +587,10 @@ async def campaign_delete_confirm(app: App, campaign_id: int) -> Screen | None:
     text = f"🗑 Удалить {what} «<b>{t.esc(campaign.name)}</b>» вместе с постами?"
     if campaign.is_draft:
         text += "\n\nРассылки, созданные из него, останутся — просто перестанут быть связаны с черновиком."
+    else:
+        count = len(await app.repo.campaign_targets(campaign.id))
+        if count:
+            text += f"\n\nПубликации прекратятся во всех её чатах ({count})."
     keyboard = markup(
         [btn("🗑 Да, удалить", CampAct(a="del_ok", id=campaign.id), RED)],
         back("camp", campaign.id, "✖️ Отмена"),
@@ -490,15 +600,19 @@ async def campaign_delete_confirm(app: App, campaign_id: int) -> Screen | None:
 
 async def send_now_confirm(app: App, campaign_id: int) -> Screen | None:
     campaign = await app.repo.get_campaign(campaign_id)
-    if campaign is None or campaign.chat_id is None:
+    if campaign is None or campaign.is_draft:
         return None
-    chat = await app.repo.get_chat(campaign.chat_id)
+    targets = await app.repo.campaign_targets(campaign.id)
+    ready = [x.chat.title for x in targets if x.deliverable]
     posts = await app.repo.list_posts(campaign.id)
-    title = t.esc(chat.title) if chat else "чат"
-    text = (
-        f"🚀 Опубликовать следующий пост рассылки «<b>{t.esc(campaign.name)}</b>» в «{title}» прямо сейчас?\n\n"
-        "Расписание не изменится."
-    )
+    text = f"🚀 Опубликовать следующий пост рассылки «<b>{t.esc(campaign.name)}</b>» прямо сейчас?\n\n"
+    if ready:
+        text += f"Чаты ({len(ready)}): {t.names_label(ready, 10)}\n"
+        if len(targets) > len(ready):
+            text += f"Пропущены — сейчас недоступны: {len(targets) - len(ready)}\n"
+    else:
+        text += "⚠️ Сейчас нет чатов, куда бот может публиковать.\n"
+    text += "Расписание не изменится."
     if len(posts) > 1 and campaign.rotation == "sequential":
         ids = [p.id for p in posts]
         number = (ids.index(campaign.last_post_id) + 1) % len(ids) + 1 if campaign.last_post_id in ids else 1
@@ -516,9 +630,9 @@ async def draft_saved(app: App, draft_id: int, source_id: int) -> Screen | None:
         return None
     text = (
         f"💾 Черновик «<b>{t.esc(draft.name)}</b>» сохранён.\n\n"
-        "Теперь его можно применить к другим чатам. Если потом изменить черновик, "
-        "кнопка «🔄 Обновить во всех» перенесёт изменения во все чаты, где он применён "
-        "(включая эту рассылку)."
+        "Черновик — заготовка: посты, расписание и опции. «📤 Применить к чатам» публикует его в нужных чатах, "
+        "а если потом изменить черновик, «🔄 Обновить рассылки» перенесёт изменения в эту рассылку "
+        "и во все, созданные из него."
     )
     keyboard = markup(
         [btn("📤 Применить к чатам", CampAct(a="apply", id=draft.id), GREEN)],
@@ -533,21 +647,116 @@ async def sync_confirm(app: App, draft_id: int) -> Screen | None:
     if draft is None:
         return None
     linked = await app.repo.linked_campaigns(draft.id)
-    chats = {c.id: c for c in await app.repo.list_chats()}
-    names = [t.esc(chats[c.chat_id].title, 40) for c in linked if c.chat_id in chats]
+    targets = await app.repo.targets_of(c.id for c in linked)
+    items = []
+    for campaign in linked[:20]:
+        names = [x.chat.title for x in targets[campaign.id]]
+        items.append(f"• «{t.esc(campaign.name, 40)}» — {t.names_label(names) if names else 'чаты не выбраны'}")
     text = (
         f"🔄 Обновить рассылки из черновика «<b>{t.esc(draft.name)}</b>»?\n\n"
         f"Посты, расписание и опции будут заменены в {len(linked)} "
         f"{t.plural(len(linked), 'рассылке', 'рассылках', 'рассылках')}:\n"
-        + "\n".join(f"• {name}" for name in names[:20])
-        + ("\n…" if len(names) > 20 else "")
-        + "\n\nСтатус (работает/пауза) и тема форума у каждой останутся прежними."
+        + "\n".join(items)
+        + ("\n…" if len(linked) > 20 else "")
+        + "\n\nЧаты и статус (работает/остановлена) у рассылок останутся прежними."
     )
     keyboard = markup(
         [btn("🔄 Обновить", CampAct(a="sync_ok", id=draft.id), GREEN)],
         back("camp", draft.id, "✖️ Отмена"),
     )
     return text, keyboard
+
+
+# -------------------------------------------------------------------- чаты рассылки
+
+
+async def targets_view(app: App, campaign_id: int, page: int = 0, note: str | None = None) -> Screen | None:
+    campaign = await app.repo.get_campaign(campaign_id)
+    if campaign is None or campaign.is_draft:
+        return None
+    targets = await app.repo.campaign_targets(campaign.id)
+    by_chat = {x.chat.id: x for x in targets}
+    # Отметить можно работающий чат; уже отмеченные показываем всегда, чтобы их можно было снять
+    chats = [c for c in await app.repo.list_chats() if c.status == "active" or c.id in by_chat]
+    pages, page = _pages(len(chats), page, TARGETS_PAGE_SIZE)
+    shown = chats[page * TARGETS_PAGE_SIZE : (page + 1) * TARGETS_PAGE_SIZE]
+
+    lines = [f"<b>💬 Чаты рассылки «{t.esc(campaign.name)}»</b>", ""]
+    if chats:
+        lines.append(
+            "Отметьте чаты, в которые публиковать. Посты, расписание и опции общие для всех отмеченных чатов. "
+            "Изменения сохраняются сразу."
+        )
+        lines += ["", f"Выбрано: <b>{len(targets)}</b> из {len(chats)}"]
+    else:
+        lines.append(
+            "Чатов пока нет. Добавьте бота администратором в группу или канал — чат появится здесь "
+            "(кнопки «➕ Добавить…» внизу экрана или раздел «💬 Мои чаты»)."
+        )
+    problems = target_lines(targets)
+    if problems:
+        lines += ["", *problems]
+    if campaign.is_active and not any(x.deliverable for x in targets):
+        lines += ["", "⚠️ Рассылка запущена, но публиковать некуда — отметьте чат, где бот может публиковать."]
+    if any(x.chat.is_forum for x in targets):
+        lines += ["", "🧵 В форумах можно выбрать тему — у каждого чата она своя."]
+    if note:
+        lines += ["", note]
+
+    cid = campaign.id
+    rows: list[list[InlineKeyboardButton] | None] = []
+    for chat in shown:
+        target = by_chat.get(chat.id)
+        mark = "☑️" if target else "⬜"
+        marks = ""
+        if chat.status == "left":
+            marks += " 🚫"
+        elif chat.status == "pending":
+            marks += " ⏳"
+        elif not chat.can_post:
+            marks += " ⚠️"
+        if target is not None and target.link.paused:
+            marks += " ⏸"
+        if target is not None and target.link.thread_id:
+            marks += f" 🧵{target.link.thread_id}"
+        type_icon = t.CHAT_ICONS.get(chat.type, "💬")
+        rows.append(
+            [
+                btn(
+                    f"{mark} {type_icon} {t.cut(chat.title, 34)}{marks}",
+                    TargetAct(a="off" if target else "on", id=cid, v=chat.id, p=page),
+                )
+            ]
+        )
+    rows.append(_pager(page, pages, lambda p: TargetAct(a="pg", id=cid, v=p, p=p)))
+    if chats:
+        rows.append(
+            [
+                btn("☑️ Все", TargetAct(a="all", id=cid, p=page)),
+                btn("⬜ Снять все", TargetAct(a="none", id=cid, p=page)),
+            ]
+        )
+    for chat in shown:
+        target = by_chat.get(chat.id)
+        if target is None:
+            continue
+        if chat.is_forum:
+            topic = f"#{target.link.thread_id}" if target.link.thread_id else "General"
+            rows.append(
+                [btn(f"🧵 Тема в «{t.cut(chat.title, 22)}»: {topic}", TargetAct(a="thr", id=cid, v=chat.id, p=page))]
+            )
+        if target.link.paused:
+            rows.append(
+                [
+                    btn(
+                        f"▶️ Возобновить в «{t.cut(chat.title, 24)}»",
+                        TargetAct(a="resume", id=cid, v=chat.id, p=page),
+                        GREEN,
+                    )
+                ]
+            )
+    rows.append(back("camp", cid, "« К рассылке"))
+    return "\n".join(lines), markup(*rows)
 
 
 # --------------------------------------------------------------------------- посты
@@ -558,8 +767,7 @@ async def posts_view(app: App, campaign_id: int, page: int = 0) -> Screen | None
     if campaign is None:
         return None
     posts = await app.repo.list_posts(campaign.id)
-    pages = max(1, math.ceil(len(posts) / POSTS_PAGE_SIZE))
-    page = min(max(page, 0), pages - 1)
+    pages, page = _pages(len(posts), page, POSTS_PAGE_SIZE)
     first = page * POSTS_PAGE_SIZE
     shown = list(enumerate(posts, start=1))[first : first + POSTS_PAGE_SIZE]
     lines = [f"<b>📝 Посты · «{t.esc(campaign.name)}»</b>", ""]
@@ -572,15 +780,7 @@ async def posts_view(app: App, campaign_id: int, page: int = 0) -> Screen | None
         if pages > 1:
             lines.append(f"Всего постов: {len(posts)}")
         for index, post in shown:
-            snippet = post_text(post.kind, post.payload)
-            line = f"{index}. {post_title(post.kind, post.payload)}"
-            if snippet:
-                line += f" — <i>{t.esc(t.cut(snippet, 50))}</i>"
-            if post.buttons:
-                line += f" · 🔘{count_buttons(post.buttons)}"
-            if post.send_mode == "forward" and post.forward_from:
-                line += " · ↪️"
-            lines.append(line)
+            lines.append(f"{index}. {_post_line(post)}")
         if len(posts) > 1:
             order = "по очереди" if campaign.rotation == "sequential" else "в случайном порядке (без повтора подряд)"
             lines += ["", f"Посты публикуются {order}: по одному за каждый слот расписания."]
@@ -605,15 +805,33 @@ async def posts_view(app: App, campaign_id: int, page: int = 0) -> Screen | None
     return "\n".join(lines), markup(*rows)
 
 
-async def post_view(app: App, post_id: int, note: str | None = None) -> Screen | None:
+def _post_line(post: Post, snippet_limit: int = 50) -> str:
+    snippet = post_text(post.kind, post.payload)
+    line = post_title(post.kind, post.payload)
+    if snippet:
+        line += f" — <i>{t.esc(t.cut(snippet, snippet_limit))}</i>"
+    if post.buttons:
+        line += f" · 🔘{count_buttons(post.buttons)}"
+    if post.send_mode == "forward" and post.forward_from:
+        line += " · ↪️"
+    return line
+
+
+def _owner_label(campaign: Campaign, limit: int = 30) -> str:
+    return ("📝 " if campaign.is_draft else "📬 ") + t.cut(campaign.name, limit)
+
+
+async def post_view(app: App, post_id: int, note: str | None = None, *, origin: int = 0) -> Screen | None:
+    """origin — страница «Моих постов» + 1, если пост открыт оттуда (0 — из постов рассылки)."""
     post = await app.repo.get_post(post_id)
     if post is None:
         return None
     posts = await app.repo.list_posts(post.campaign_id)
     campaign = await app.repo.get_campaign(post.campaign_id)
     index = [p.id for p in posts].index(post.id) + 1
+    owner = t.esc(_owner_label(campaign, 60)) if campaign else ""
     lines = [
-        f"<b>Пост #{index} из {len(posts)}</b> · «{t.esc(campaign.name if campaign else '')}»",
+        f"<b>Пост #{index} из {len(posts)}</b> · {owner}",
         "",
         f"Тип: {post_title(post.kind, post.payload)}",
     ]
@@ -638,35 +856,109 @@ async def post_view(app: App, post_id: int, note: str | None = None) -> Screen |
     if note:
         lines += ["", note]
 
+    pid, f = post.id, origin
     rows: list[list[InlineKeyboardButton] | None] = []
-    first = [btn("👁 Показать", PostAct(a="show", id=post.id))]
+    first = [btn("👁 Показать", PostAct(a="show", id=pid, f=f))]
     if supports_buttons(post.kind) and not forward:
-        first.append(btn("🔘 Кнопки", PostAct(a="btn", id=post.id)))
+        first.append(btn("🔘 Кнопки", PostAct(a="btn", id=pid, f=f)))
     rows.append(first)
-    rows.append([btn("🔄 Заменить содержимое", PostAct(a="replace", id=post.id))])
+    rows.append([btn("🔄 Заменить содержимое", PostAct(a="replace", id=pid, f=f))])
     if post.forward_from:
         rows.append(
             [
                 btn(
                     "📋 Сделать копией" if forward else "↪️ Публиковать пересылкой",
-                    PostAct(a="copy" if forward else "fwd", id=post.id),
+                    PostAct(a="copy" if forward else "fwd", id=pid, f=f),
                 )
             ]
         )
     if len(posts) > 1:
-        rows.append([btn("⬆️ Выше", PostAct(a="up", id=post.id)), btn("⬇️ Ниже", PostAct(a="down", id=post.id))])
-    rows.append([btn("🗑 Удалить пост", PostAct(a="del", id=post.id), RED)])
-    rows.append([btn("« К постам", Nav(to="posts", id=post.campaign_id, page=(index - 1) // POSTS_PAGE_SIZE))])
+        rows.append([btn("⬆️ Выше", PostAct(a="up", id=pid, f=f)), btn("⬇️ Ниже", PostAct(a="down", id=pid, f=f))])
+    if origin:
+        rows.append([btn("✨ Новая рассылка с этим постом", LibAct(a="new", id=pid, f=f), GREEN)])
+    rows.append([btn("📋 Копировать в другую рассылку", LibAct(a="to", id=pid, f=f))])
+    if origin and campaign is not None:
+        rows.append([btn(f"{_owner_label(campaign, 40)} — открыть", Nav(to="camp", id=campaign.id, f=-1))])
+    rows.append([btn("🗑 Удалить пост", PostAct(a="del", id=pid, f=f), RED)])
+    if origin:
+        rows.append([btn("« Мои посты", Nav(to="lib", page=origin - 1))])
+    else:
+        rows.append([btn("« К постам", Nav(to="posts", id=post.campaign_id, page=(index - 1) // POSTS_PAGE_SIZE))])
     return "\n".join(lines), markup(*rows)
 
 
-async def post_delete_confirm(app: App, post_id: int) -> Screen | None:
+async def post_delete_confirm(app: App, post_id: int, origin: int = 0) -> Screen | None:
     post = await app.repo.get_post(post_id)
     if post is None:
         return None
     text = f"🗑 Удалить пост «{post_title(post.kind, post.payload)}»?"
-    keyboard = markup([btn("🗑 Да, удалить", PostAct(a="del_ok", id=post.id), RED)], back("post", post.id, "✖️ Отмена"))
+    keyboard = markup(
+        [btn("🗑 Да, удалить", PostAct(a="del_ok", id=post.id, f=origin), RED)],
+        [btn("✖️ Отмена", Nav(to="post", id=post.id, f=origin))],
+    )
     return text, keyboard
+
+
+# ---------------------------------------------------------------------- мои посты
+
+
+async def library_view(app: App, page: int = 0, note: str | None = None) -> Screen:
+    total = await app.repo.count_posts_total()
+    pages, page = _pages(total, page, POSTS_PAGE_SIZE)
+    items = await app.repo.list_all_posts(page * POSTS_PAGE_SIZE, POSTS_PAGE_SIZE)
+    lines = ["<b>🗂 Мои посты</b>", ""]
+    if not total:
+        lines.append(
+            "Постов пока нет. Нажмите «➕ Новый пост» и пришлите сообщение: текст, фото, видео, альбом "
+            "или пересланный пост. Для поста сразу появится рассылка — останется отметить чаты и задать время."
+        )
+    else:
+        lines.append(
+            "Все посты из рассылок и черновиков, новые — сверху. Откройте пост, чтобы посмотреть, изменить, "
+            "скопировать в другую рассылку или сделать из него новую."
+        )
+        lines += ["", f"Всего постов: <b>{total}</b>"]
+        for number, (post, campaign) in enumerate(items, start=page * POSTS_PAGE_SIZE + 1):
+            lines.append(f"{number}. {_post_line(post, 40)} · {t.esc(_owner_label(campaign))}")
+    if note:
+        lines += ["", note]
+    rows: list[list[InlineKeyboardButton] | None] = []
+    for number, (post, _campaign) in enumerate(items, start=page * POSTS_PAGE_SIZE + 1):
+        snippet = t.cut(post_text(post.kind, post.payload), 24)
+        label = f"{number}. {post_title(post.kind, post.payload)} {snippet}".strip()
+        rows.append([btn(label, Nav(to="post", id=post.id, f=page + 1))])
+    rows.append(_pager(page, pages, lambda p: Nav(to="lib", page=p)))
+    rows.append([btn("➕ Новый пост", LibAct(a="add", id=0), GREEN)])
+    rows.append(back("main", text="« Меню"))
+    return "\n".join(lines), markup(*rows)
+
+
+async def copy_post_view(app: App, post_id: int, page: int = 0, origin: int = 0) -> Screen | None:
+    post = await app.repo.get_post(post_id)
+    if post is None:
+        return None
+    candidates = [
+        c for c in [*await app.repo.list_campaigns(), *await app.repo.list_drafts()] if c.id != post.campaign_id
+    ]
+    pages, page = _pages(len(candidates), page)
+    lines = [
+        "<b>📋 Копировать пост</b>",
+        "",
+        f"{_post_line(post)}",
+        "",
+    ]
+    if candidates:
+        lines.append("Выберите рассылку или черновик — копия поста встанет в конец его списка постов.")
+    else:
+        lines.append("Других рассылок и черновиков пока нет — можно сделать новую рассылку с этим постом.")
+    rows: list[list[InlineKeyboardButton] | None] = [
+        [btn(_owner_label(c, 40), LibAct(a="cp", id=post.id, v=c.id, f=origin))]
+        for c in candidates[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    ]
+    rows.append(_pager(page, pages, lambda p: LibAct(a="to", id=post.id, v=p, f=origin)))
+    rows.append([btn("✨ Новая рассылка с этим постом", LibAct(a="new", id=post.id, f=origin), GREEN)])
+    rows.append([btn("« К посту", Nav(to="post", id=post.id, f=origin))])
+    return "\n".join(lines), markup(*rows)
 
 
 # ---------------------------------------------------------------------- расписание
@@ -779,7 +1071,7 @@ async def options_view(app: App, campaign_id: int, note: str | None = None) -> S
     campaign = await app.repo.get_campaign(campaign_id)
     if campaign is None:
         return None
-    chat = await app.repo.get_chat(campaign.chat_id) if campaign.chat_id else None
+    targets = [] if campaign.is_draft else await app.repo.campaign_targets(campaign.id)
     lines = [
         f"<b>⚙️ Опции · «{t.esc(campaign.name)}»</b>",
         "",
@@ -788,11 +1080,12 @@ async def options_view(app: App, campaign_id: int, note: str | None = None) -> S
         "📌 <b>Закреплять</b> — новый пост закрепляется, прошлый открепляется.",
         "🗑 <b>Удалять прошлый</b> — после публикации бот удаляет предыдущий пост этой рассылки "
         "(Telegram разрешает удалять только сообщения моложе 48 часов).",
+        "",
+        "Опции общие для всех чатов рассылки. Тема форума у каждого чата своя — она задаётся в «💬 Чаты».",
     ]
-    if chat is not None and chat.is_forum:
-        lines.append("🧵 <b>Тема</b> — в какую тему форума публиковать (по умолчанию «General»).")
-    if chat is not None and campaign.pin and not chat.can_pin:
-        lines += ["", "⚠️ У бота нет права закреплять сообщения в этом чате."]
+    no_pin = [x.chat.title for x in targets if x.chat.status == "active" and not x.chat.can_pin]
+    if campaign.pin and no_pin:
+        lines += ["", f"⚠️ Нет права закреплять сообщения в: {t.names_label(no_pin, 5)}"]
     if campaign.delete_prev and su.max_gap_hours(campaign.times, campaign.weekdays) > 48:
         lines += ["", "⚠️ Между публикациями больше 48 часов — удалить прошлый пост не получится."]
     if note:
@@ -812,11 +1105,8 @@ async def options_view(app: App, campaign_id: int, note: str | None = None) -> S
                 OptAct(a="delprev", id=cid, v=int(not campaign.delete_prev)),
             )
         ],
+        back("camp", cid),
     ]
-    if chat is not None and chat.is_forum:
-        topic = f"#{campaign.thread_id}" if campaign.thread_id else "General"
-        rows.append([btn(f"🧵 Тема: {topic}", OptAct(a="thread", id=cid))])
-    rows.append(back("camp", cid))
     return "\n".join(lines), markup(*rows)
 
 
@@ -832,7 +1122,7 @@ async def drafts_list(app: App, page: int = 0) -> Screen:
         "<b>📝 Черновики</b>",
         "",
         "Черновик — заготовка рассылки: посты, расписание и опции. Его можно применить к любым чатам "
-        "в пару нажатий, а после правок — обновить везде сразу.",
+        "в пару нажатий, а после правок — обновить созданные из него рассылки.",
     ]
     if not drafts:
         lines += [
@@ -852,36 +1142,39 @@ async def drafts_list(app: App, page: int = 0) -> Screen:
 
 
 async def picker_view(app: App, data: dict[str, Any]) -> Screen | None:
-    """Выбор чатов для применения черновика (mode=draft) или копирования рассылки (mode=copy)."""
+    """Выбор чатов, к которым применить черновик."""
     source = await app.repo.get_campaign(int(data["src"]))
-    if source is None:
+    if source is None or not source.is_draft:
         return None
-    mode = data["mode"]
-    chats = [
-        c for c in await app.repo.list_chats(statuses=("active",)) if not (mode == "copy" and c.id == source.chat_id)
-    ]
+    chats = await app.repo.list_chats(statuses=("active",))
     selected = {int(x) for x in data.get("sel", [])} & {c.id for c in chats}
-    linked = {c.chat_id for c in await app.repo.linked_campaigns(source.id)} if mode == "draft" else set()
+    linked = await app.repo.linked_campaigns(source.id)
+    linked_targets = await app.repo.targets_of(c.id for c in linked)
+    already = {x.chat.id for items in linked_targets.values() for x in items}
     pages, page = _pages(len(chats), int(data.get("page", 0)))
 
-    if mode == "draft":
-        lines = [f"<b>📤 Применить черновик «{t.esc(source.name)}»</b>", ""]
-    else:
-        lines = [f"<b>📋 Копировать «{t.esc(source.name)}» в другие чаты</b>", ""]
+    lines = [f"<b>📤 Применить черновик «{t.esc(source.name)}»</b>", ""]
     if chats:
-        lines.append(
-            "Отметьте чаты и нажмите кнопку внизу. В каждом появится рассылка с этими постами, расписанием и опциями."
-        )
         if linked:
-            lines.append("🔄 — черновик уже применён в этом чате: рассылка обновится, а не задублируется.")
+            lines.append(
+                f"Из черновика уже есть рассылка «{t.esc(linked[0].name)}». Отмеченные чаты добавятся к ней, "
+                "а её посты, расписание и опции обновятся по черновику."
+            )
+        else:
+            lines.append(
+                "Отметьте чаты и нажмите кнопку внизу. Из черновика получится рассылка с его постами, "
+                "расписанием и опциями — она будет публиковать во все отмеченные чаты."
+            )
+        if already:
+            lines.append("🔄 — чат уже есть в рассылке из этого черновика.")
         lines += ["", f"Выбрано: <b>{len(selected)}</b> из {len(chats)}"]
     else:
-        lines.append("Нет подходящих чатов. Добавьте бота администратором в другие чаты — они появятся здесь.")
+        lines.append("Нет подходящих чатов. Добавьте бота администратором в чаты — они появятся здесь.")
 
     rows: list[list[InlineKeyboardButton] | None] = []
     for chat in chats[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]:
         mark = "☑️" if chat.id in selected else "⬜"
-        suffix = " 🔄" if chat.id in linked else ""
+        suffix = " 🔄" if chat.id in already else ""
         rows.append([btn(f"{mark} {t.cut(chat.title, 38)}{suffix}", PickAct(a="t", s=source.id, v=chat.id))])
     rows.append(_pager(page, pages, lambda p: PickAct(a="pg", s=source.id, v=p)))
     if chats:
@@ -889,36 +1182,33 @@ async def picker_view(app: App, data: dict[str, Any]) -> Screen | None:
             [btn("☑️ Выбрать все", PickAct(a="all", s=source.id)), btn("⬜ Снять все", PickAct(a="none", s=source.id))]
         )
         rows.append([btn("🚀 Применить и запустить", PickAct(a="go", s=source.id, v=1), GREEN)])
-        rows.append([btn("💾 Применить на паузе", PickAct(a="go", s=source.id, v=0))])
+        rows.append([btn("💾 Применить без запуска", PickAct(a="go", s=source.id, v=0))])
     rows.append(back("camp", source.id, "✖️ Отмена"))
     return "\n".join(lines), markup(*rows)
 
 
-async def apply_summary(app: App, source_id: int, results: list[tuple[int, bool]], warnings: list[str]) -> Screen:
-    source = await app.repo.get_campaign(source_id)
-    chats = {c.id: c for c in await app.repo.list_chats()}
+async def apply_summary(app: App, draft_id: int, campaign_id: int, created: bool, warnings: list[str]) -> Screen:
+    campaign = await app.repo.get_campaign(campaign_id)
     tz, now = app.settings.tz, _now(app)
-    created = sum(1 for _, is_new in results if is_new)
-    lines = ["<b>✅ Готово</b>", "", f"Создано рассылок: {created} · обновлено: {len(results) - created}", ""]
-    for campaign_id, _ in results[:30]:
-        campaign = await app.repo.get_campaign(campaign_id)
-        if campaign is None or campaign.chat_id not in chats:
-            continue
+    lines = ["<b>✅ Готово</b>", ""]
+    if campaign is not None:
+        targets = await app.repo.campaign_targets(campaign.id)
+        lines.append(("Создана рассылка" if created else "Обновлена рассылка") + f" «<b>{t.esc(campaign.name)}</b>».")
+        lines.append(f"💬 Чаты ({len(targets)}): {t.names_label([x.chat.title for x in targets], 10)}")
         if campaign.is_active and campaign.next_run_ts:
-            status = f"🟢 ближайшая {t.fmt_ts(campaign.next_run_ts, tz, now)}"
+            status = f"🟢 работает, ближайшая {t.fmt_ts(campaign.next_run_ts, tz, now)}"
         elif campaign.is_active:
             status = "🟢 запущена"
         else:
-            status = "⏸ на паузе"
-        lines.append(f"• {t.esc(chats[campaign.chat_id].title, 40)} — {status}")
-    if len(results) > 30:
-        lines.append(f"…и ещё {len(results) - 30}")
+            status = "⏸ остановлена — проверьте и нажмите «▶️ Запустить»"
+        lines.append(f"Статус: {status}")
     if warnings:
         lines += ["", *(w if len(w) < 1500 else w[:1500] + "…" for w in warnings)]
-    back_row = (
-        back("camp", source.id, "« К черновику" if source and source.is_draft else "« К рассылке") if source else None
-    )
-    return "\n".join(lines), markup(back_row, [btn("💬 Мои чаты", Nav(to="chats"))])
+    rows = []
+    if campaign is not None:
+        rows.append([btn("📬 Открыть рассылку", Nav(to="camp", id=campaign.id, f=-1), BLUE)])
+    rows.append(back("camp", draft_id, "« К черновику"))
+    return "\n".join(lines), markup(*rows)
 
 
 # ------------------------------------------------------------------------ настройки
@@ -978,21 +1268,20 @@ async def timezone_view(app: App) -> Screen:
 
 async def upcoming_view(app: App) -> Screen:
     tz, now = app.settings.tz, _now(app)
-    items = [(c, chat) for c, chat in await app.repo.active_campaigns_with_chats() if c.next_run_ts][:10]
+    items = [c for c in await app.repo.active_campaigns() if c.next_run_ts][:10]
+    targets = await app.repo.targets_of(c.id for c in items)
     lines = ["<b>📅 Ближайшие публикации</b>", ""]
     if app.settings.paused_all:
         lines.append("⏸ Все рассылки на паузе — публикаций не будет, пока не возобновите их в настройках.")
     elif not items:
-        lines.append("Запланированных публикаций нет. Запустите рассылку в любом чате.")
+        lines.append("Запланированных публикаций нет. Запустите любую рассылку в «📬 Рассылки».")
     else:
-        for campaign, chat in items:
-            lines.append(
-                f"• <b>{t.fmt_ts(campaign.next_run_ts, tz, now)}</b> — "
-                f"{t.esc(chat.title, 30)} · «{t.esc(campaign.name, 30)}»"
-            )
+        for campaign in items:
+            names = [x.chat.title for x in targets[campaign.id] if x.deliverable]
+            where = t.names_label(names, 2, 24) if names else "⚠️ нет доступных чатов"
+            lines.append(f"• <b>{t.fmt_ts(campaign.next_run_ts, tz, now)}</b> — «{t.esc(campaign.name, 30)}» → {where}")
     rows: list[list[InlineKeyboardButton] | None] = [
-        [btn(f"{t.fmt_ts(c.next_run_ts, tz, now)} · {t.cut(chat.title, 28)}", Nav(to="camp", id=c.id))]
-        for c, chat in items
+        [btn(f"{t.fmt_ts(c.next_run_ts, tz, now)} · {t.cut(c.name, 28)}", Nav(to="camp", id=c.id, f=-1))] for c in items
     ]
     rows.append([btn("🔄 Обновить", Nav(to="upcoming")), btn("« Меню", Nav(to="main"))])
     return "\n".join(lines), markup(*rows)
@@ -1001,14 +1290,18 @@ async def upcoming_view(app: App) -> Screen:
 def help_view() -> Screen:
     text = (
         "<b>❓ Как пользоваться</b>\n\n"
-        "<b>1. Добавьте бота в чат.</b> Кнопки «➕ Добавить группу/канал» внизу откроют выбор чата — "
+        "<b>1. Добавьте бота в чаты.</b> Кнопки «➕ Добавить группу/канал» внизу откроют выбор чата — "
         "Telegram сам сделает бота администратором. Можно и вручную: настройки чата → Администраторы. "
         "Для канала нужно право «Публикация сообщений», для закрепления — «Закрепление» "
         "(в канале — «Редактирование»).\n\n"
-        "<b>2. Создайте рассылку.</b> Мои чаты → чат → «➕ Новая рассылка». Добавьте посты — просто пришлите "
-        "боту сообщения (или перешлите из канала). Затем задайте время и нажмите «▶️ Запустить».\n\n"
-        "<b>3. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. Потом «📤 Применить к чатам» "
-        "— и та же рассылка появится в любых чатах. Изменили черновик — «🔄 Обновить во всех».\n\n"
+        "<b>2. Создайте рассылку.</b> «📬 Рассылки» → «➕ Новая рассылка». В «💬 Чаты» отметьте галочками, "
+        "куда публиковать, в «📝 Посты» пришлите боту сообщения (или перешлите их из канала), задайте время "
+        "и нажмите «▶️ Запустить». Одна рассылка публикует одни и те же посты по одному расписанию "
+        "во все отмеченные чаты.\n\n"
+        "<b>3. Мои посты.</b> «🗂 Мои посты» — все посты из рассылок и черновиков. Пост можно открыть, "
+        "изменить, скопировать в другую рассылку или сделать из него новую рассылку.\n\n"
+        "<b>4. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. «📤 Применить к чатам» "
+        "запускает черновик в нужных чатах. Изменили черновик — «🔄 Обновить рассылки».\n\n"
         "<b>Кнопки под постом</b> (одна строка — один ряд):\n"
         "<code>Текст - https://ссылка</code>\n"
         "<code>Кнопка 1 - https://a.ru | Кнопка 2 - t.me/channel</code>\n"
@@ -1021,7 +1314,8 @@ def help_view() -> Screen:
         "<b>Ограничения Telegram.</b> К альбомам нельзя добавить кнопки. Удалить прошлый пост можно, только если "
         "ему меньше 48 часов. Плашку «бот закрепил сообщение» бот удалить не может. "
         "Подпись к медиа — до 1024 символов.\n\n"
-        "Команды: /start — меню, /chats — чаты, /drafts — черновики, /settings — настройки, /cancel — отменить ввод."
+        "Команды: /start — меню, /campaigns — рассылки, /posts — мои посты, /chats — чаты, "
+        "/drafts — черновики, /settings — настройки, /cancel — отменить ввод."
     )
     return text, markup(back("main", text="« Меню"))
 
@@ -1029,7 +1323,7 @@ def help_view() -> Screen:
 # --------------------------------------------------------------------------- навигация
 
 
-async def resolve(app: App, nav: Nav) -> Screen | None:
+async def resolve(app: App, nav: Nav, user_id: int | None = None) -> Screen | None:
     match nav.to:
         case "main":
             return await main_menu(app)
@@ -1037,12 +1331,18 @@ async def resolve(app: App, nav: Nav) -> Screen | None:
             return await chats_list(app, nav.page)
         case "chat":
             return await chat_view(app, nav.id)
+        case "camps":
+            return await campaigns_list(app, nav.page)
         case "camp":
-            return await campaign_view(app, nav.id)
+            return await campaign_view(app, nav.id, user_id=user_id)
+        case "tgt":
+            return await targets_view(app, nav.id, nav.page)
         case "posts":
             return await posts_view(app, nav.id, nav.page)
         case "post":
-            return await post_view(app, nav.id)
+            return await post_view(app, nav.id, origin=nav.f)
+        case "lib":
+            return await library_view(app, nav.page)
         case "sched":
             return await schedule_view(app, nav.id)
         case "opts":

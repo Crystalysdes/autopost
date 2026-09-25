@@ -110,7 +110,7 @@ def period_label(start: str | None, end: str | None) -> str:
     return "без ограничений"
 
 
-def options_label(silent: bool, protect: bool, pin: bool, delete_prev: bool, thread_id: int | None) -> str:
+def options_label(silent: bool, protect: bool, pin: bool, delete_prev: bool) -> str:
     parts = []
     if silent:
         parts.append("🔕 без звука")
@@ -120,9 +120,14 @@ def options_label(silent: bool, protect: bool, pin: bool, delete_prev: bool, thr
         parts.append("📌 закреплять")
     if delete_prev:
         parts.append("🗑 удалять прошлый")
-    if thread_id:
-        parts.append(f"🧵 тема #{thread_id}")
     return " · ".join(parts) if parts else "стандартные"
+
+
+def names_label(names: Sequence[str], limit: int = 3, width: int = 30) -> str:
+    """«A, B, C и ещё 2» — названия уже экранированы для HTML."""
+    shown = [esc(name, width) for name in names[:limit]]
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" и ещё {rest}" if rest > 0 else "")
 
 
 def chat_kind(chat_type: str) -> str:
@@ -154,15 +159,15 @@ def chat_pending_text(title: str, chat_type: str, actor_name: str, actor_id: int
 def chat_back_text(title: str) -> str:
     return (
         f"✅ Бот снова в «<b>{esc(title)}</b>».\n"
-        "Рассылки этого чата стоят на паузе — запустите их, когда будете готовы."
+        "Рассылки, в которых отмечен этот чат, снова публикуют в него по расписанию."
     )
 
 
 def chat_lost_text(title: str, reason: str) -> str:
     return (
         f"🚫 Бот потерял доступ к «<b>{esc(title)}</b>»: {esc(reason)}.\n\n"
-        "Рассылки этого чата поставлены на паузу. Верните бота администратором — "
-        "чат снова станет активным, а все настройки сохранятся."
+        "Публикации в этот чат приостановлены, в остальных чатах рассылки работают как обычно. "
+        "Верните бота администратором — публикации возобновятся сами, настройки сохранятся."
     )
 
 
@@ -173,29 +178,56 @@ def lost_post_right_text(title: str) -> str:
     )
 
 
-def send_failed_text(name: str, chat_title: str, error: str) -> str:
+def _failure_lines(failures: Sequence[tuple[str, str]], limit: int = 10) -> str:
+    lines = [f"• «{esc(title, 40)}» — <i>{esc(error, 200)}</i>" for title, error in failures[:limit]]
+    if len(failures) > limit:
+        lines.append(f"…и ещё {len(failures) - limit}")
+    return "\n".join(lines)
+
+
+def send_failed_text(name: str, failures: Sequence[tuple[str, str]], total: int) -> str:
+    """failures — [(название чата, причина)]; total — во сколько чатов публиковали."""
+    if len(failures) == 1:
+        title, error = failures[0]
+        head = (
+            f"⚠️ Не удалось опубликовать пост рассылки «<b>{esc(name)}</b>» в «{esc(title)}».\n"
+            f"Причина: <i>{esc(error, 400)}</i>"
+        )
+    else:
+        head = (
+            f"⚠️ Не удалось опубликовать пост рассылки «<b>{esc(name)}</b>» в {len(failures)} "
+            f"{plural(len(failures), 'чат', 'чата', 'чатов')}:\n{_failure_lines(failures)}"
+        )
+    if total > len(failures):
+        head += "\nВ остальных чатах пост опубликован."
+    return head + "\n\nБот попробует снова в следующий раз по расписанию."
+
+
+def auto_paused_text(name: str, failures: Sequence[tuple[str, str]], fails: int) -> str:
+    """failures — [(название чата, последняя ошибка)] чатов, поставленных на паузу."""
+    streak = f"{fails} {plural(fails, 'ошибка', 'ошибки', 'ошибок')} подряд"
+    if len(failures) == 1:
+        title, error = failures[0]
+        head = (
+            f"⏸ Рассылка «<b>{esc(name)}</b>»: публикации в «{esc(title)}» приостановлены — {streak}.\n"
+            f"Последняя: <i>{esc(error, 400)}</i>"
+        )
+    else:
+        head = (
+            f"⏸ Рассылка «<b>{esc(name)}</b>»: публикации приостановлены в {len(failures)} "
+            f"{plural(len(failures), 'чате', 'чатах', 'чатах')} — {streak}:\n{_failure_lines(failures)}"
+        )
     return (
-        f"⚠️ Не удалось опубликовать пост рассылки «<b>{esc(name)}</b>» в «{esc(chat_title)}».\n"
-        f"Причина: <i>{esc(error, 400)}</i>\n\n"
-        "Бот попробует снова в следующий раз по расписанию."
+        head + "\n\nВ остальных чатах рассылка работает. Исправьте причину и нажмите «▶️ Возобновить» "
+        "в «💬 Чаты рассылки»."
     )
 
 
-def auto_paused_text(name: str, chat_title: str, fails: int, error: str) -> str:
+def finished_text(name: str) -> str:
+    return f"🏁 Рассылка «<b>{esc(name)}</b>» завершена: период публикаций закончился."
+
+
+def no_posts_text(name: str) -> str:
     return (
-        f"⏸ Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» остановлена: "
-        f"{fails} {plural(fails, 'ошибка', 'ошибки', 'ошибок')} подряд.\n"
-        f"Последняя: <i>{esc(error, 400)}</i>\n\n"
-        "Исправьте причину и запустите рассылку снова."
-    )
-
-
-def finished_text(name: str, chat_title: str) -> str:
-    return f"🏁 Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» завершена: период публикаций закончился."
-
-
-def no_posts_text(name: str, chat_title: str) -> str:
-    return (
-        f"⚠️ Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» остановлена: в ней не осталось постов. "
-        "Добавьте посты и запустите её снова."
+        f"⚠️ Рассылка «<b>{esc(name)}</b>» остановлена: в ней не осталось постов. Добавьте посты и запустите её снова."
     )

@@ -11,7 +11,6 @@ from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
 from bot.services import chats as chat_service
-from bot.services.campaigns import schedule_problems
 from bot.ui import keyboards, screens
 from bot.ui.callbacks import ApplyDraft, ChatAct
 from bot.ui.render import show
@@ -19,7 +18,10 @@ from bot.ui.render import show
 router = Router(name="chats")
 router.message.filter(F.chat.type == "private")
 
-NEW_CAMPAIGN_NOTE = "👉 Добавьте посты («📝 Посты»), задайте время («⏰ Расписание») и нажмите «▶️ Запустить»."
+NEW_CAMPAIGN_NOTE = (
+    "👉 Этот чат уже отмечен. Добавьте посты («📝 Посты»), задайте время («⏰ Расписание») и нажмите "
+    "«▶️ Запустить». Другие чаты для этой же рассылки — кнопка «💬 Чаты»."
+)
 
 
 async def _gone(callback: CallbackQuery, app: App, callback_answer: CallbackAnswer) -> None:
@@ -134,9 +136,11 @@ async def new_campaign(
     chat = await app.repo.get_chat(callback_data.id)
     if chat is None:
         return await _gone(callback, app, callback_answer)
-    number = await app.repo.count_campaigns(chat.id) + 1
-    campaign = await app.repo.create_campaign(chat.id, f"Рассылка {number}")
-    await show(app, callback, await screens.campaign_view(app, campaign.id, note=NEW_CAMPAIGN_NOTE))
+    number = await app.repo.count_campaigns() + 1
+    campaign = await app.repo.create_campaign(f"Рассылка {number}", chat_ids=[chat.id])
+    app.remember_origin(callback.from_user.id, campaign.id, chat.id)
+    screen = await screens.campaign_view(app, campaign.id, note=NEW_CAMPAIGN_NOTE, user_id=callback.from_user.id)
+    await show(app, callback, screen or await screens.chat_view(app, chat.id))
 
 
 @router.callback_query(ChatAct.filter(F.a == "fromdraft"))
@@ -156,44 +160,38 @@ async def apply_draft(
     chat = await app.repo.get_chat(callback_data.chat)
     if chat is None:
         return await _gone(callback, app, callback_answer)
-    results = await app.repo.apply_template(callback_data.draft, [chat.id], activate=None, link=True)
-    if not results:
+    result = await app.repo.apply_draft(callback_data.draft, [chat.id], activate=False)
+    if result is None:
         callback_answer.text = "Черновик уже удалён"
         await show(app, callback, await screens.chat_view(app, chat.id))
         return
-    campaign, created = results[0]
+    campaign, created = result
     if app.scheduler:
         await app.scheduler.reschedule([campaign.id])
     if created:
-        note = "✅ Черновик применён. Проверьте рассылку и нажмите «▶️ Запустить»."
+        note = "✅ Из черновика создана рассылка с этим чатом. Проверьте её и нажмите «▶️ Запустить»."
     else:
-        note = "🔄 Рассылка в этом чате уже была создана из этого черновика — она обновлена."
-    await show(app, callback, await screens.campaign_view(app, campaign.id, note=note))
+        note = (
+            "🔄 Рассылка из этого черновика уже была — чат добавлен в неё, а посты, расписание и опции "
+            "обновлены по черновику."
+        )
+    app.remember_origin(callback.from_user.id, campaign.id, chat.id)
+    screen = await screens.campaign_view(app, campaign.id, note=note, user_id=callback.from_user.id)
+    await show(app, callback, screen or await screens.chat_view(app, chat.id))
 
 
 @router.callback_query(ChatAct.filter(F.a == "resume"))
-async def resume_all(
+async def resume_chat(
     callback: CallbackQuery, callback_data: ChatAct, app: App, callback_answer: CallbackAnswer
 ) -> None:
+    """Снимает паузу после ошибок со всех рассылок этого чата."""
     chat = await app.repo.get_chat(callback_data.id)
     if chat is None:
         return await _gone(callback, app, callback_answer)
     if chat.status != "active" or not chat.can_post:
-        callback_answer.text = "Бот не может публиковать в этом чате"
+        callback_answer.text = "Бот не может публиковать в этом чате — сначала верните ему права"
         callback_answer.show_alert = True
         return
-    now = app.scheduler.now() if app.scheduler else 0
-    started, skipped = [], 0
-    for campaign in await app.repo.list_campaigns(chat.id):
-        if campaign.is_active:
-            continue
-        posts = await app.repo.list_posts(campaign.id)
-        if schedule_problems(campaign, posts, app.settings.tz, now):
-            skipped += 1
-            continue
-        await app.repo.update_campaign(campaign.id, is_active=True, fail_count=0)
-        started.append(campaign.id)
-    if app.scheduler and started:
-        await app.scheduler.reschedule(started)
-    callback_answer.text = f"▶️ Запущено: {len(started)}" + (f", не готовы к запуску: {skipped}" if skipped else "")
+    resumed = await app.repo.resume_chat_targets(chat.id)
+    callback_answer.text = f"▶️ Возобновлено в рассылках: {resumed}" if resumed else "Паузы уже нет"
     await show(app, callback, await screens.chat_view(app, chat.id))

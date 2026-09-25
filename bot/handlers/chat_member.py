@@ -28,7 +28,7 @@ async def on_my_chat_member(event: ChatMemberUpdated, app: App) -> None:
 
     if change.prev_status in (None, "left", "pending") and change.status == "active":
         if change.prev_status == "left":
-            await app.notify(texts.chat_back_text(chat.title), keyboards.chat_back(chat.id))
+            await app.notify(texts.chat_back_text(chat.title), keyboards.open_chat(chat.id))
         else:
             await app.notify(
                 texts.chat_added_text(chat.title, chat.type, chat.can_post, chat.can_pin),

@@ -70,10 +70,23 @@ class App:
     scheduler: Scheduler | None = field(default=None, repr=False)
     # Админы, которым уже установлено меню команд
     commands_ready: set[int] = field(default_factory=set)
+    # Из какого чата админ открыл рассылку: туда ведёт «« Назад» (после перезапуска — к списку рассылок)
+    origins: dict[tuple[int, int], int] = field(default_factory=dict)
 
     @property
     def admin_ids(self) -> tuple[int, ...]:
         return tuple(self.config.admin_ids)
+
+    def origin(self, user_id: int | None, campaign_id: int) -> int:
+        return self.origins.get((user_id or 0, campaign_id), 0)
+
+    def remember_origin(self, user_id: int | None, campaign_id: int, chat_id: int) -> None:
+        """chat_id > 0 — рассылку открыли из этого чата, иначе — из списков."""
+        key = (user_id or 0, campaign_id)
+        if chat_id > 0:
+            self.origins[key] = chat_id
+        else:
+            self.origins.pop(key, None)
 
     def is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.config.admin_ids

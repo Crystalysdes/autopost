@@ -1,4 +1,4 @@
-"""Выбор чатов с галочками: применение черновика и копирование рассылки."""
+"""Выбор чатов с галочками для применения черновика."""
 
 from __future__ import annotations
 
@@ -20,11 +20,8 @@ from bot.ui.render import show
 router = Router(name="drafts")
 
 
-async def _eligible_chat_ids(app: App, data: dict[str, Any]) -> list[int]:
-    source = await app.repo.get_campaign(int(data["src"]))
-    chats = await app.repo.list_chats(statuses=("active",))
-    exclude = source.chat_id if source and data["mode"] == "copy" else None
-    return [c.id for c in chats if c.id != exclude]
+async def _eligible_chat_ids(app: App) -> list[int]:
+    return [c.id for c in await app.repo.list_chats(statuses=("active",))]
 
 
 @router.callback_query(PickAct.filter(), Picker.picking)
@@ -55,7 +52,7 @@ async def on_pick(
     elif action == "pg":
         data["page"] = callback_data.v
     elif action == "all":
-        selected = set(await _eligible_chat_ids(app, data))
+        selected = set(await _eligible_chat_ids(app))
     elif action == "none":
         selected = set()
     data["sel"] = sorted(selected)
@@ -84,43 +81,41 @@ async def _apply(
 ) -> bool:
     """Применяет выбор. False — применить не вышло и окно выбора стоит оставить открытым."""
     source = await app.repo.get_campaign(int(data["src"]))
-    if source is None:
-        callback_answer.text = "Источник уже удалён"
+    if source is None or not source.is_draft:
+        callback_answer.text = "Черновик уже удалён"
         await show(app, callback, await screens.main_menu(app))
         return True
-    eligible = set(await _eligible_chat_ids(app, data))
-    selected = [chat_id for chat_id in data.get("sel", []) if chat_id in eligible]
+    chats = {c.id: c for c in await app.repo.list_chats(statuses=("active",))}
+    selected = [chat_id for chat_id in data.get("sel", []) if chat_id in chats]
     if not selected:
         callback_answer.text = "Отметьте хотя бы один чат"
         callback_answer.show_alert = True
         return False
-    posts = await app.repo.list_posts(source.id)
-    now = app.scheduler.now() if app.scheduler else 0
     if activate:
+        posts = await app.repo.list_posts(source.id)
+        now = app.scheduler.now() if app.scheduler else 0
         problems = schedule_problems(source, posts, app.settings.tz, now)
+        if not any(chats[chat_id].can_post for chat_id in selected):
+            problems.append("Ни в одном из отмеченных чатов у бота нет права публиковать")
         if problems:
-            callback_answer.text = problems[0] + " — или примените на паузе"
+            callback_answer.text = problems[0] + " — или примените без запуска"
             callback_answer.show_alert = True
             return False
 
-    results = await app.repo.apply_template(source.id, selected, activate=activate, link=data["mode"] == "draft")
-    chats = {c.id: c for c in await app.repo.list_chats()}
+    result = await app.repo.apply_draft(source.id, selected, activate=activate)
+    if result is None:
+        callback_answer.text = "Черновик уже удалён"
+        await show(app, callback, await screens.main_menu(app))
+        return True
+    campaign, created = result
     warnings: list[str] = []
-    without_rights = [c.id for c, _ in results if not chats[c.chat_id].can_post]
-    if without_rights:
-        for campaign_id in without_rights:
-            await app.repo.update_campaign(campaign_id, is_active=False)
-        names = ", ".join(t.esc(chats[c.chat_id].title, 30) for c, _ in results if c.id in without_rights)
-        warnings.append(f"⚠️ Нет права публиковать, рассылки оставлены на паузе: {names}")
-    if source.pin:
-        no_pin = [t.esc(chats[c.chat_id].title, 30) for c, _ in results if not chats[c.chat_id].can_pin]
-        if no_pin:
-            warnings.append("📌 Нет права закреплять: " + ", ".join(no_pin))
+    no_post = [chats[chat_id].title for chat_id in selected if not chats[chat_id].can_post]
+    if no_post:
+        warnings.append(f"⚠️ Нет права публиковать — туда посты не пойдут, пока его нет: {t.names_label(no_post, 10)}")
+    no_pin = [chats[chat_id].title for chat_id in selected if not chats[chat_id].can_pin]
+    if source.pin and no_pin:
+        warnings.append(f"📌 Нет права закреплять: {t.names_label(no_pin, 10)}")
     if app.scheduler:
-        await app.scheduler.reschedule([c.id for c, _ in results])
-    await show(
-        app,
-        callback,
-        await screens.apply_summary(app, source.id, [(c.id, created) for c, created in results], warnings),
-    )
+        await app.scheduler.reschedule([campaign.id])
+    await show(app, callback, await screens.apply_summary(app, source.id, campaign.id, created, warnings))
     return True

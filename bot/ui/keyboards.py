@@ -69,15 +69,16 @@ def chat_pending(chat_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def chat_back(chat_id: int) -> InlineKeyboardMarkup:
+def campaign_problem(campaign_id: int) -> InlineKeyboardMarkup:
     return markup(
-        [btn("▶️ Запустить все рассылки", ChatAct(a="resume", id=chat_id), GREEN)],
-        [btn("⚙️ Открыть чат", Nav(to="chat", id=chat_id))],
+        [btn("💬 Чаты рассылки", Nav(to="tgt", id=campaign_id), BLUE)],
+        [btn("📬 Открыть рассылку", Nav(to="camp", id=campaign_id))],
     )
 
 
-def done_adding(campaign_id: int) -> InlineKeyboardMarkup:
-    return markup([btn("✅ Готово", CampAct(a="done", id=campaign_id), GREEN)])
+def done_adding(campaign_id: int, action: str = "done") -> InlineKeyboardMarkup:
+    """action: done — после «Готово» список постов, fin — экран рассылки (пост из «Моих постов»)."""
+    return markup([btn("✅ Готово", CampAct(a=action, id=campaign_id), GREEN)])
 
 
 def _rights(**enabled: bool) -> ChatAdministratorRights:

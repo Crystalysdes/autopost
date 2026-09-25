@@ -7,9 +7,9 @@
 1. claim — одной транзакцией сдвигаем расписание вперёд (UPDATE ... WHERE next_run_ts = старое).
    Только после этого отправляем: даже если процесс упадёт сразу после отправки,
    этот слот повторно не уйдёт.
-2. отправка вне транзакции;
-3. удаление/открепление прошлого поста, закрепление нового;
-4. запись результата.
+2. пост уходит по очереди в каждый отмеченный чат рассылки (вне транзакции);
+3. в каждом чате — удаление/открепление прошлого поста, закрепление нового;
+4. запись результата по каждому чату. Ошибка в одном чате не мешает остальным.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from aiogram.exceptions import (
 
 from bot.app import App
 from bot.db.models import Campaign, Chat, Post
-from bot.db.repo import Claim, ClaimDecision
+from bot.db.repo import Claim, ClaimDecision, Target
 from bot.services import chats as chat_service
 from bot.services.errors import humanize
 from bot.services.schedule_utils import ScheduleSpec, effective_jitter, following_slots, plan_next
@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 TICK_SECONDS = 10
 GRACE_SECONDS = 15 * 60  # насколько можно опоздать со слотом (например, после перезапуска)
 MAX_PARALLEL = 5
-MAX_FAILS = 5  # после стольких ошибок подряд рассылка встаёт на паузу
+MAX_FAILS = 5  # после стольких ошибок подряд публикации в чат встают на паузу
 RETRY_AFTER_LIMIT = 60  # флуд-контроль: ждём и повторяем, только если пауза не дольше минуты
+TARGET_GAP = 0.05  # пауза между чатами одной рассылки — бережём лимиты Telegram
 
 
 def spec_of(campaign: Campaign) -> ScheduleSpec:
@@ -98,12 +99,15 @@ def predict_runs(
 
 
 @dataclass
-class Delivery:
-    campaign: Campaign
+class Outcome:
+    """Итог публикации в один чат."""
+
     chat: Chat
-    post: Post
-    manual: bool
-    finished: bool = False
+    ok: bool
+    error: str | None = None
+    fails: int = 0  # ошибок подряд в этом чате
+    paused: bool = False  # чат рассылки только что поставлен на паузу
+    lost: bool = False  # бота нет в чате
 
 
 class Scheduler:
@@ -216,50 +220,55 @@ class Scheduler:
         return ClaimDecision(next_slot_ts=slot, next_run_ts=run, post=post, skipped=overdue, finished=slot is None)
 
     async def _handle_claim(self, claim: Claim) -> None:
-        campaign, chat, decision = claim.campaign, claim.chat, claim.decision
+        campaign, decision = claim.campaign, claim.decision
         if decision.skipped:
             logger.info("Рассылка %s: слот пропущен (бот был недоступен)", campaign.id)
-            if decision.finished:
-                await self._notify_finished(campaign, chat)
+        elif decision.post is None:
+            await self.app.repo.stop_campaign(campaign.id, "В рассылке нет постов", now=self.now())
+            await self.app.notify(texts.no_posts_text(campaign.name), keyboards.open_campaign(campaign.id))
             return
-        if decision.post is None:
-            await self.app.repo.record_failed(
-                campaign.id, chat.id, None, "В рассылке нет постов", manual=False, now=self.now(), max_fails=1
-            )
-            await self.app.repo.update_campaign(campaign.id, is_active=False, next_slot_ts=None, next_run_ts=None)
-            await self.app.notify(texts.no_posts_text(campaign.name, chat.title), keyboards.open_campaign(campaign.id))
-            return
-        await self._deliver(
-            Delivery(campaign=campaign, chat=chat, post=decision.post, manual=False, finished=decision.finished)
-        )
+        elif not claim.targets:
+            logger.info("Рассылка %s: нет чатов, куда можно публиковать — слот пропущен", campaign.id)
+        else:
+            outcomes = await self._deliver_all(campaign, claim.targets, decision.post, manual=False)
+            await self._report(campaign, outcomes)
+        if decision.finished:
+            await self.app.notify(texts.finished_text(campaign.name), keyboards.open_campaign(campaign.id))
 
     # --------------------------------------------------------------- отправка
 
     async def send_now(self, campaign_id: int) -> tuple[bool, str]:
-        """«Отправить сейчас»: следующий по очереди пост, расписание не меняется."""
+        """«Отправить сейчас»: следующий по очереди пост во все доступные чаты, расписание не меняется."""
         if self.lock(campaign_id).locked():
             return False, "Пост этой рассылки уже отправляется — подождите пару секунд"
         async with self.lock(campaign_id):
             repo = self.app.repo
             campaign = await repo.get_campaign(campaign_id)
-            if campaign is None or campaign.chat_id is None:
+            if campaign is None or campaign.is_draft:
                 return False, "Рассылка не найдена"
-            chat = await repo.get_chat(campaign.chat_id)
-            if chat is None or chat.status != "active":
-                return False, "Чат недоступен: бот не состоит в нём или чат не подтверждён"
+            targets = [t for t in await repo.campaign_targets(campaign.id) if t.deliverable]
+            if not targets:
+                return False, "Нет чатов, куда бот может публиковать — отметьте их в «💬 Чаты»"
             posts = await repo.list_posts(campaign.id)
             post = pick_post(posts, campaign.last_post_id, campaign.rotation, self.rng)
             if post is None:
                 return False, "В рассылке нет постов"
             await repo.mark_post_used(campaign.id, post.id)
             number = [p.id for p in posts].index(post.id) + 1
-            result = await self._deliver(Delivery(campaign=campaign, chat=chat, post=post, manual=True))
-            if result is None:
-                fresh = await repo.get_campaign(campaign.id)
-                return False, (fresh.last_error if fresh and fresh.last_error else "Не удалось отправить")
-            return True, f"Пост #{number} опубликован в «{chat.title}»"
+            outcomes = await self._deliver_all(campaign, targets, post, manual=True)
+            return send_summary(number, outcomes)
 
-    async def _send(self, tg_id: int, post: PostData, campaign: Campaign) -> SendResult:
+    async def _deliver_all(
+        self, campaign: Campaign, targets: list[Target], post: Post, *, manual: bool
+    ) -> list[Outcome]:
+        outcomes = []
+        for index, target in enumerate(targets):
+            if index:
+                await asyncio.sleep(TARGET_GAP)
+            outcomes.append(await self._deliver(campaign, target, post, manual=manual))
+        return outcomes
+
+    async def _send(self, tg_id: int, post: PostData, campaign: Campaign, thread_id: int | None) -> SendResult:
         for attempt in (1, 2):
             try:
                 return await send_post(
@@ -268,7 +277,7 @@ class Scheduler:
                     post,
                     silent=campaign.silent,
                     protect=campaign.protect,
-                    thread_id=campaign.thread_id,
+                    thread_id=thread_id,
                 )
             except TelegramRetryAfter as error:
                 if attempt == 1 and error.retry_after <= RETRY_AFTER_LIMIT:
@@ -277,56 +286,43 @@ class Scheduler:
                 raise
         raise AssertionError("unreachable")
 
-    async def _deliver(self, delivery: Delivery) -> SendResult | None:
-        campaign, chat = delivery.campaign, delivery.chat
+    async def _deliver(self, campaign: Campaign, target: Target, post: Post, *, manual: bool) -> Outcome:
+        chat = target.chat
         tg_id = chat.tg_id
-        post = PostData.of(delivery.post)
-        prev_ids = [i for i in (campaign.last_message_ids or []) if i]
+        data = PostData.of(post)
+        thread_id = target.link.thread_id
+        prev_ids = [i for i in (target.link.last_message_ids or []) if i]
         try:
             try:
-                result = await self._send(tg_id, post, campaign)
+                result = await self._send(tg_id, data, campaign, thread_id)
             except TelegramMigrateToChat as error:
                 await chat_service.migrate(self.app, tg_id, error.migrate_to_chat_id)
                 tg_id = error.migrate_to_chat_id
                 # Запись чата могла слиться с новой; id старых сообщений в супергруппе чужие
-                delivery.chat = chat = await self.app.repo.get_chat_by_tg(tg_id) or chat
+                chat = await self.app.repo.get_chat_by_tg(tg_id) or chat
                 prev_ids = []
-                result = await self._send(tg_id, post, campaign)
+                result = await self._send(tg_id, data, campaign, thread_id)
         except TelegramForbiddenError as error:
-            await self._chat_lost(delivery, humanize(error))
-            return None
+            return await self._chat_lost(campaign, chat, post, humanize(error), manual=manual)
         except TelegramBadRequest as error:
             if "chat not found" in error.message.lower():
-                await self._chat_lost(delivery, humanize(error))
-            else:
-                await self._failed(delivery, humanize(error))
-            return None
+                return await self._chat_lost(campaign, chat, post, humanize(error), manual=manual)
+            return await self._failed(campaign, chat, post, humanize(error), manual=manual)
         except PostSendError as error:
-            await self._failed(delivery, str(error))
-            return None
+            return await self._failed(campaign, chat, post, str(error), manual=manual)
         except TelegramAPIError as error:
             # Сюда попадают и таймауты: пост мог уже уйти, поэтому не повторяем — дубль хуже пропуска
-            await self._failed(delivery, humanize(error))
-            return None
+            return await self._failed(campaign, chat, post, humanize(error), manual=manual)
         except Exception as error:
             logger.exception("Непредвиденная ошибка отправки")
-            await self._failed(delivery, f"Непредвиденная ошибка: {error}")
-            return None
+            return await self._failed(campaign, chat, post, f"Непредвиденная ошибка: {error}", manual=manual)
 
         warning = await self._after_send(tg_id, campaign, result, prev_ids)
-        await self.app.repo.record_sent(
-            campaign.id,
-            chat.id,
-            delivery.post.id,
-            result.usable_ids,
-            manual=delivery.manual,
-            now=self.now(),
-            warning=warning,
+        await self.app.repo.record_target_sent(
+            campaign.id, chat.id, post.id, result.usable_ids, manual=manual, now=self.now(), warning=warning
         )
         logger.info("Опубликовано: рассылка %s -> чат %s (%s)", campaign.id, tg_id, result.message_ids)
-        if delivery.finished:
-            await self._notify_finished(campaign, chat)
-        return result
+        return Outcome(chat=chat, ok=True, error=warning)
 
     async def _after_send(self, tg_id: int, campaign: Campaign, result: SendResult, prev_ids: list[int]) -> str | None:
         bot = self.app.bot
@@ -355,44 +351,52 @@ class Scheduler:
             warnings.append("иконки на кнопках недоступны боту — отправлено без них")
         return "; ".join(warnings) or None
 
-    async def _failed(self, delivery: Delivery, error_text: str) -> None:
-        campaign, chat = delivery.campaign, delivery.chat
-        fails, paused = await self.app.repo.record_failed(
-            campaign.id,
-            chat.id,
-            delivery.post.id,
-            error_text,
-            manual=delivery.manual,
-            now=self.now(),
-            max_fails=MAX_FAILS,
+    async def _failed(self, campaign: Campaign, chat: Chat, post: Post, error: str, *, manual: bool) -> Outcome:
+        fails, paused = await self.app.repo.record_target_failed(
+            campaign.id, chat.id, post.id, error, manual=manual, now=self.now(), max_fails=MAX_FAILS
         )
-        logger.warning("Ошибка публикации: рассылка %s -> %s: %s", campaign.id, chat.tg_id, error_text)
-        if delivery.manual:
-            return
-        if paused:
-            await self.app.notify(
-                texts.auto_paused_text(campaign.name, chat.title, fails, error_text),
-                keyboards.open_campaign(campaign.id),
-            )
-        elif fails == 1 and self.app.settings.notify_errors:
-            await self.app.notify(
-                texts.send_failed_text(campaign.name, chat.title, error_text),
-                keyboards.open_campaign(campaign.id),
-            )
+        logger.warning("Ошибка публикации: рассылка %s -> %s: %s", campaign.id, chat.tg_id, error)
+        return Outcome(chat=chat, ok=False, error=error, fails=fails, paused=paused)
 
-    async def _chat_lost(self, delivery: Delivery, reason: str) -> None:
-        campaign, chat = delivery.campaign, delivery.chat
-        await self.app.repo.record_failed(
-            campaign.id,
-            chat.id,
-            delivery.post.id,
-            reason,
-            manual=delivery.manual,
-            now=self.now(),
-            max_fails=MAX_FAILS,
+    async def _chat_lost(self, campaign: Campaign, chat: Chat, post: Post, reason: str, *, manual: bool) -> Outcome:
+        """Бота удалили из чата: чат пропускается всеми рассылками, пока бота не вернут."""
+        await self.app.repo.record_target_failed(
+            campaign.id, chat.id, post.id, reason, manual=manual, now=self.now(), max_fails=None
         )
         await self.app.repo.set_chat_status(chat.id, "left")
         await self.app.notify(texts.chat_lost_text(chat.title, reason), keyboards.open_chat(chat.id))
+        return Outcome(chat=chat, ok=False, error=reason, lost=True)
 
-    async def _notify_finished(self, campaign: Campaign, chat: Chat) -> None:
-        await self.app.notify(texts.finished_text(campaign.name, chat.title), keyboards.open_campaign(campaign.id))
+    async def _report(self, campaign: Campaign, outcomes: list[Outcome]) -> None:
+        """Одно уведомление на запуск, а не на каждый чат. О повторных ошибках в том же чате
+        не напоминаем — только о первой в серии и об автопаузе."""
+        paused = [(o.chat.title, o.error or "") for o in outcomes if o.paused]
+        if paused:
+            await self.app.notify(
+                texts.auto_paused_text(campaign.name, paused, MAX_FAILS), keyboards.campaign_problem(campaign.id)
+            )
+        fresh = [(o.chat.title, o.error or "") for o in outcomes if not o.ok and not o.lost and o.fails == 1]
+        if fresh and self.app.settings.notify_errors:
+            await self.app.notify(
+                texts.send_failed_text(campaign.name, fresh, len(outcomes)), keyboards.open_campaign(campaign.id)
+            )
+
+
+def send_summary(number: int, outcomes: list[Outcome]) -> tuple[bool, str]:
+    """Итог «Отправить сейчас» для экрана рассылки."""
+    sent = [o for o in outcomes if o.ok]
+    failed = [o for o in outcomes if not o.ok]
+    if len(outcomes) == 1:
+        if sent:
+            return True, f"Пост #{number} опубликован в «{sent[0].chat.title}»"
+        return False, failed[0].error or "Не удалось отправить"
+    problems = "; ".join(f"«{o.chat.title}»: {o.error}" for o in failed[:5])
+    if len(failed) > 5:
+        problems += f" и ещё {len(failed) - 5}"
+    if not sent:
+        return False, problems
+    chats = texts.plural(len(outcomes), "чата", "чатов", "чатов")
+    text = f"Пост #{number} опубликован в {len(sent)} из {len(outcomes)} {chats}"
+    if failed:
+        text += f". Не удалось: {problems}"
+    return True, text

@@ -24,6 +24,8 @@ router.message.filter(F.chat.type == "private")
 
 COMMANDS = [
     BotCommand(command="start", description="Главное меню"),
+    BotCommand(command="campaigns", description="Рассылки"),
+    BotCommand(command="posts", description="Мои посты"),
     BotCommand(command="chats", description="Мои чаты"),
     BotCommand(command="drafts", description="Черновики"),
     BotCommand(command="settings", description="Настройки"),
@@ -73,6 +75,18 @@ async def cmd_chats(message: Message, state: FSMContext, app: App) -> None:
     await show(app, message, await screens.chats_list(app))
 
 
+@router.message(Command("campaigns"))
+async def cmd_campaigns(message: Message, state: FSMContext, app: App) -> None:
+    await state.clear()
+    await show(app, message, await screens.campaigns_list(app))
+
+
+@router.message(Command("posts"))
+async def cmd_posts(message: Message, state: FSMContext, app: App) -> None:
+    await state.clear()
+    await show(app, message, await screens.library_view(app))
+
+
 @router.message(Command("drafts"))
 async def cmd_drafts(message: Message, state: FSMContext, app: App) -> None:
     await state.clear()
@@ -104,7 +118,9 @@ async def on_nav(
     callback: CallbackQuery, callback_data: Nav, state: FSMContext, app: App, callback_answer: CallbackAnswer
 ) -> None:
     await state.clear()
-    screen = await screens.resolve(app, callback_data)
+    if callback_data.to == "camp" and callback_data.f:
+        app.remember_origin(callback.from_user.id, callback_data.id, callback_data.f)
+    screen = await screens.resolve(app, callback_data, callback.from_user.id)
     if screen is None:
         callback_answer.text = "Это уже удалено"
         screen = await screens.main_menu(app)

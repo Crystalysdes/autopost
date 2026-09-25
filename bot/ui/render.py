@@ -7,12 +7,12 @@ import logging
 from typing import Any
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.app import NO_PREVIEW, App
-from bot.ui.callbacks import Nav
 from bot.ui.keyboards import btn, markup
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ async def prompt(
     new_state: State,
     text: str,
     *,
-    cancel: Nav,
+    cancel: CallbackData,
     extra: list[list[InlineKeyboardButton]] | None = None,
     **data: object,
 ) -> None:

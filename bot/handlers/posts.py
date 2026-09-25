@@ -88,6 +88,7 @@ async def on_post_message(
     fsm_snapshot: dict[str, Any] | None = None,
 ) -> None:
     campaign_id = await input_value(state, "camp_id", fsm_snapshot)
+    done = (await state.get_data()).get("done") or (fsm_snapshot or {}).get("done") or "done"
     if campaign_id is None or await app.repo.get_campaign(campaign_id) is None:
         await state.clear()
         await message.answer("Не понял, в какую рассылку добавить пост. Откройте её и нажмите «➕ Добавить посты».")
@@ -115,7 +116,7 @@ async def on_post_message(
     if notes:
         text += "\n" + "\n".join(f"• {note}" for note in notes)
     text += "\n\nПришлите ещё или нажмите «✅ Готово»."
-    await message.reply(text, reply_markup=keyboards.done_adding(campaign_id))
+    await message.reply(text, reply_markup=keyboards.done_adding(campaign_id, done))
 
 
 @router.callback_query(CampAct.filter(F.a == "done"))
@@ -157,7 +158,9 @@ async def show_post(callback: CallbackQuery, callback_data: PostAct, app: App, c
     callback_answer.disabled = True
     await callback.answer()
     note = await send_preview(app, [post], callback.from_user.id)
-    screen = await screens.post_view(app, post.id, note=note or "👆 Так пост будет выглядеть в чате.")
+    screen = await screens.post_view(
+        app, post.id, note=note or "👆 Так пост будет выглядеть в чате.", origin=callback_data.f
+    )
     if screen:
         await show(app, callback, screen, new=True)
 
@@ -181,22 +184,24 @@ async def ask_buttons(
     extra = []
     if post.buttons:
         text += "\n\n<b>Сейчас:</b>\n" + buttons_to_html(post.buttons)
-        extra.append([btn("🗑 Убрать кнопки", PostAct(a="btndel", id=post.id))])
+        extra.append([btn("🗑 Убрать кнопки", PostAct(a="btndel", id=post.id, f=callback_data.f))])
     await prompt(
         app,
         callback,
         state,
         Input.buttons,
         text,
-        cancel=Nav(to="post", id=post.id),
+        cancel=Nav(to="post", id=post.id, f=callback_data.f),
         extra=extra,
         post_id=post.id,
+        origin=callback_data.f,
     )
 
 
 @router.message(Input.buttons, F.text)
 async def on_buttons(message: Message, state: FSMContext, app: App) -> None:
     post_id = await input_value(state, "post_id")
+    origin = await input_value(state, "origin") or 0
     post = await app.repo.get_post(post_id) if post_id is not None else None
     if post is None:
         await state.clear()
@@ -220,7 +225,7 @@ async def on_buttons(message: Message, state: FSMContext, app: App) -> None:
     await app.repo.update_post(post.id, buttons=rows)
     await finish_input(app, message, state)
     note = f"✅ Кнопки сохранены ({count_buttons(rows)}). Выше — как будет выглядеть пост."
-    await show(app, message, await screens.post_view(app, post.id, note=note))
+    await show(app, message, await screens.post_view(app, post.id, note=note, origin=origin))
 
 
 @router.callback_query(PostAct.filter(F.a == "btndel"))
@@ -236,7 +241,7 @@ async def remove_buttons(
     if post is None:
         return await _gone(callback, app, callback_answer)
     callback_answer.text = "Кнопки убраны"
-    await show(app, callback, await screens.post_view(app, post.id))
+    await show(app, callback, await screens.post_view(app, post.id, origin=callback_data.f))
 
 
 @router.callback_query(PostAct.filter(F.a == "replace"))
@@ -256,8 +261,9 @@ async def ask_replace(
         state,
         Input.replace,
         "🔄 Пришлите новое содержимое поста: текст, медиа или альбом. Кнопки сохранятся.",
-        cancel=Nav(to="post", id=post.id),
+        cancel=Nav(to="post", id=post.id, f=callback_data.f),
         post_id=post.id,
+        origin=callback_data.f,
     )
 
 
@@ -270,6 +276,7 @@ async def on_replace(
     fsm_snapshot: dict[str, Any] | None = None,
 ) -> None:
     post_id = await input_value(state, "post_id", fsm_snapshot)
+    origin = await input_value(state, "origin", fsm_snapshot) or 0
     post = await app.repo.get_post(post_id) if post_id is not None else None
     if post is None:
         await state.clear()
@@ -293,7 +300,7 @@ async def on_replace(
     note = "🔄 Содержимое заменено."
     if post.buttons and not supports_buttons(captured.kind):
         note += " Кнопки сохранены, но к альбому Telegram их не прикрепит."
-    await show(app, message, await screens.post_view(app, post.id, note=note))
+    await show(app, message, await screens.post_view(app, post.id, note=note, origin=origin))
 
 
 @router.callback_query(PostAct.filter(F.a.in_({"fwd", "copy"})))
@@ -313,7 +320,7 @@ async def set_mode(callback: CallbackQuery, callback_data: PostAct, app: App, ca
             "↪️ Пост будет пересылаться из вашего чата с ботом с плашкой «Переслано из…». "
             "Не удаляйте исходное сообщение из этого чата — иначе пересылать будет нечего."
         )
-    await show(app, callback, await screens.post_view(app, post.id, note=note))
+    await show(app, callback, await screens.post_view(app, post.id, note=note, origin=callback_data.f))
 
 
 @router.callback_query(PostAct.filter(F.a.in_({"up", "down"})))
@@ -321,7 +328,7 @@ async def move_post(callback: CallbackQuery, callback_data: PostAct, app: App, c
     moved = await app.repo.move_post(callback_data.id, -1 if callback_data.a == "up" else 1)
     if not moved:
         callback_answer.text = "Дальше двигать некуда"
-    screen = await screens.post_view(app, callback_data.id)
+    screen = await screens.post_view(app, callback_data.id, origin=callback_data.f)
     if screen is None:
         return await _gone(callback, app, callback_answer)
     await show(app, callback, screen)
@@ -331,7 +338,7 @@ async def move_post(callback: CallbackQuery, callback_data: PostAct, app: App, c
 async def confirm_delete(
     callback: CallbackQuery, callback_data: PostAct, app: App, callback_answer: CallbackAnswer
 ) -> None:
-    screen = await screens.post_delete_confirm(app, callback_data.id)
+    screen = await screens.post_delete_confirm(app, callback_data.id, callback_data.f)
     if screen is None:
         return await _gone(callback, app, callback_answer)
     await show(app, callback, screen)
@@ -345,4 +352,7 @@ async def delete_post(
     if campaign_id is None:
         return await _gone(callback, app, callback_answer)
     callback_answer.text = "🗑 Пост удалён"
+    if callback_data.f:  # удаляли из «Моих постов» — туда и возвращаемся
+        await show(app, callback, await screens.library_view(app, callback_data.f - 1))
+        return
     await show(app, callback, await screens.posts_view(app, campaign_id) or await screens.main_menu(app))

@@ -19,7 +19,7 @@ router.message.filter(F.chat.type == "private")
 async def unknown_message(message: Message, app: App) -> None:
     await message.answer(
         "Не понял 🤔 Управление — кнопками меню.\n"
-        "Чтобы добавить пост: Мои чаты → чат → рассылка → «📝 Посты» → «➕ Добавить посты»."
+        "Чтобы добавить пост: «🗂 Мои посты» → «➕ Новый пост» или «📬 Рассылки» → рассылка → «📝 Посты»."
     )
     await show(app, message, await screens.main_menu(app))
 

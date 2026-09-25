@@ -22,11 +22,24 @@ from aiogram.types import (
     User,
 )
 
+from bot.db.repo import DRAFT
 from bot.services.scheduler import Scheduler
 from bot.setup import build_dispatcher
 from bot.states import Input
 from bot.storage import LeanMemoryStorage
-from bot.ui.callbacks import ApplyDraft, CampAct, ChatAct, Nav, OptAct, PickAct, PostAct, SchedAct, SetAct
+from bot.ui.callbacks import (
+    ApplyDraft,
+    CampAct,
+    ChatAct,
+    LibAct,
+    Nav,
+    OptAct,
+    PickAct,
+    PostAct,
+    SchedAct,
+    SetAct,
+    TargetAct,
+)
 from tests.conftest import BOT_ID, OWNER_ID, SECOND_ADMIN_ID, STRANGER_ID, FakeClock, admin_member, left_member
 
 OWNER = User(id=OWNER_ID, is_bot=False, first_name="Owner")
@@ -91,6 +104,22 @@ def membership(chat_id: int, *, actor: User = OWNER, new: Any = None, chat_type:
 def owner_texts(session) -> list[str]:
     """Тексты сообщений владельцу (новые и отредактированные) в хронологическом порядке."""
     return [r.text for r in session.requests if isinstance(r, (SendMessage, EditMessageText)) and r.chat_id == OWNER_ID]
+
+
+def last_markup(session) -> Any:
+    """Inline-клавиатура последнего экрана у владельца."""
+    for request in reversed(session.requests):
+        if (
+            isinstance(request, (SendMessage, EditMessageText))
+            and request.chat_id == OWNER_ID
+            and hasattr(request.reply_markup, "inline_keyboard")
+        ):
+            return request.reply_markup
+    return None
+
+
+def button_data(markup: Any) -> list[str]:
+    return [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
 
 
 @pytest.fixture
@@ -173,7 +202,7 @@ async def test_notifications_go_to_all_admins(feed, app, session):
 
 async def test_preview_goes_to_requesting_admin(feed, app, session):
     chat = await add_chat(feed, app, -100470)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await app.repo.add_post(campaign.id, kind="text", payload={"text": "Пост для второго"})
     await feed(press(CampAct(a="preview", id=campaign.id), user=SECOND))
     previews = [r.chat_id for r in session.calls(SendMessage) if r.text == "Пост для второго"]
@@ -197,14 +226,17 @@ async def test_stranger_adds_bot_owner_accepts(feed, app, session):
     assert (await app.repo.get_chat(chat.id)).status == "active"
 
 
-async def test_bot_removed_pauses_and_notifies(feed, app, session):
+async def test_bot_removed_keeps_campaign_and_notifies(feed, app, session):
     chat = await add_chat(feed, app, -100650)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await app.repo.update_campaign(campaign.id, is_active=True, next_run_ts=1, next_slot_ts=1)
     await feed(membership(-100650, actor=STRANGER, new=left_member()))
     assert (await app.repo.get_chat(chat.id)).status == "left"
-    assert (await app.repo.get_campaign(campaign.id)).is_active is False
+    assert (await app.repo.get_campaign(campaign.id)).is_active is True  # чат просто пропускается
     assert "потерял доступ" in owner_texts(session)[-1]
+    await feed(membership(-100650))  # бота вернули
+    assert "снова публикуют" in owner_texts(session)[-1]
+    assert (await app.repo.campaign_targets(campaign.id))[0].deliverable
 
 
 async def test_chat_shared_registers_chat(feed, app, session):
@@ -262,7 +294,7 @@ async def test_full_campaign_flow(feed, dp, bot, app, session, clock):
 
 async def test_album_is_one_post(feed, dp, bot, app, session):
     chat = await add_chat(feed, app, -100800)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await feed(press(CampAct(a="add", id=campaign.id)))
     photos = [
         private_message(
@@ -282,7 +314,7 @@ async def test_album_is_one_post(feed, dp, bot, app, session):
 
 async def test_unsupported_content_is_rejected(feed, app, session):
     chat = await add_chat(feed, app, -100810)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await feed(press(CampAct(a="add", id=campaign.id)))
     await feed(private_message(dice={"emoji": "🎲", "value": 3}))
     assert await app.repo.list_posts(campaign.id) == []
@@ -291,7 +323,7 @@ async def test_unsupported_content_is_rejected(feed, app, session):
 
 async def test_buttons_flow_and_validation(feed, dp, bot, app, session):
     chat = await add_chat(feed, app, -100900)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     post, _ = await app.repo.add_post(campaign.id, kind="text", payload={"text": "Пост"})
 
     await feed(press(PostAct(a="btn", id=post.id)), private_message("Кнопка без ссылки"))
@@ -311,7 +343,7 @@ async def test_buttons_flow_and_validation(feed, dp, bot, app, session):
 async def test_draft_save_and_apply_via_picker(feed, app):
     chat_a = await add_chat(feed, app, -101001)
     chat_b = await add_chat(feed, app, -101002)
-    campaign = await app.repo.create_campaign(chat_a.id, "Реклама")
+    campaign = await app.repo.create_campaign("Реклама", chat_ids=[chat_a.id])
     await app.repo.add_post(campaign.id, kind="text", payload={"text": "Пост"})
     await app.repo.update_campaign(campaign.id, times=["12:00"])
 
@@ -322,23 +354,24 @@ async def test_draft_save_and_apply_via_picker(feed, app):
         press(PickAct(a="t", s=draft.id, v=chat_b.id)),
         press(PickAct(a="go", s=draft.id, v=1)),
     )
-    created = await app.repo.list_campaigns(chat_b.id)
-    assert len(created) == 1 and created[0].is_active and created[0].next_run_ts
-    assert created[0].source_draft_id == draft.id
-    linked = {c.id for c in await app.repo.linked_campaigns(draft.id)}
-    assert linked == {campaign.id, created[0].id}
+    # Одна общая рассылка: чат B добавился к рассылке, из которой сохранили черновик
+    assert [c.id for c in await app.repo.list_campaigns()] == [campaign.id]
+    fresh = await app.repo.get_campaign(campaign.id)
+    assert fresh.is_active and fresh.next_run_ts and fresh.source_draft_id == draft.id
+    assert {t.chat.id for t in await app.repo.campaign_targets(campaign.id)} == {chat_a.id, chat_b.id}
+    assert [c.id for c in await app.repo.linked_campaigns(draft.id)] == [campaign.id]
 
-    # Правим черновик и обновляем во всех чатах
+    # Правим черновик и обновляем рассылки из него
     await app.repo.update_campaign(draft.id, times=["08:00", "20:00"])
     await feed(press(CampAct(a="sync_ok", id=draft.id)))
-    assert (await app.repo.get_campaign(created[0].id)).times == ["08:00", "20:00"]
     assert (await app.repo.get_campaign(campaign.id)).times == ["08:00", "20:00"]
+    assert len(await app.repo.campaign_targets(campaign.id)) == 2
 
 
 async def test_stale_picker_buttons_do_not_apply(feed, app, session):
     chat = await add_chat(feed, app, -101050)
-    draft_a = await app.repo.create_campaign(None, "A")
-    draft_b = await app.repo.create_campaign(None, "B")
+    draft_a = await app.repo.create_campaign("A", kind=DRAFT)
+    draft_b = await app.repo.create_campaign("B", kind=DRAFT)
     for draft in (draft_a, draft_b):
         await app.repo.add_post(draft.id, kind="text", payload={"text": "x"})
     await feed(press(CampAct(a="apply", id=draft_a.id)), press(PickAct(a="t", s=draft_a.id, v=chat.id)))
@@ -350,23 +383,27 @@ async def test_stale_picker_buttons_do_not_apply(feed, app, session):
 
 async def test_apply_draft_from_chat_screen(feed, app):
     chat = await add_chat(feed, app, -101100)
-    draft = await app.repo.create_campaign(None, "Шаблон")
+    other = await add_chat(feed, app, -101101)
+    draft = await app.repo.create_campaign("Шаблон", kind=DRAFT)
     await app.repo.add_post(draft.id, kind="text", payload={"text": "x"})
     await feed(press(ApplyDraft(chat=chat.id, draft=draft.id)))
     await feed(press(ApplyDraft(chat=chat.id, draft=draft.id)))  # повторно — без дубля
-    assert len(await app.repo.list_campaigns(chat.id)) == 1
+    await feed(press(ApplyDraft(chat=other.id, draft=draft.id)))  # другой чат — в ту же рассылку
+    campaigns = await app.repo.list_campaigns()
+    assert len(campaigns) == 1 and not campaigns[0].is_active
+    assert {t.chat.id for t in await app.repo.campaign_targets(campaigns[0].id)} == {chat.id, other.id}
 
 
 async def test_count_helper_sets_even_times(feed, app):
     chat = await add_chat(feed, app, -101200)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await feed(press(SchedAct(a="n", id=campaign.id, v=4)), press(SchedAct(a="w", id=campaign.id, v=4, w=0)))
     assert (await app.repo.get_campaign(campaign.id)).times == ["09:00", "13:00", "17:00", "21:00"]
 
 
 async def test_timezone_change_reschedules(feed, app):
     chat = await add_chat(feed, app, -101300)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
     await app.repo.update_campaign(campaign.id, times=["12:00"], is_active=True)
     await app.scheduler.reschedule([campaign.id])
@@ -375,6 +412,181 @@ async def test_timezone_change_reschedules(feed, app):
     assert app.settings.timezone == "UTC"
     after = (await app.repo.get_campaign(campaign.id)).next_run_ts
     assert after - before == 3 * 3600
+
+
+# ----------------------------------------------------------------- чаты рассылки
+
+
+async def test_main_menu_has_campaigns_and_posts(feed, session):
+    await feed(private_message("/start"))
+    data = button_data(last_markup(session))
+    assert Nav(to="camps").pack() in data and Nav(to="lib").pack() in data
+
+
+async def test_new_campaign_from_list_and_checkboxes(feed, app, session):
+    chat_a = await add_chat(feed, app, -102001)
+    chat_b = await add_chat(feed, app, -102002)
+    await feed(press(Nav(to="camps")), press(CampAct(a="new", id=0)))
+    campaign = (await app.repo.list_campaigns())[0]
+    assert await app.repo.campaign_targets(campaign.id) == []
+    assert "Чаты рассылки" in owner_texts(session)[-1]
+
+    await feed(
+        press(TargetAct(a="on", id=campaign.id, v=chat_a.id)),
+        press(TargetAct(a="on", id=campaign.id, v=chat_b.id)),
+    )
+    assert {t.chat.id for t in await app.repo.campaign_targets(campaign.id)} == {chat_a.id, chat_b.id}
+    assert "Выбрано: <b>2</b>" in owner_texts(session)[-1]
+    # Значение приходит в кнопке: повторное «снять» не отмечает чат обратно
+    off = TargetAct(a="off", id=campaign.id, v=chat_a.id)
+    await feed(press(off), press(off))
+    assert [t.chat.id for t in await app.repo.campaign_targets(campaign.id)] == [chat_b.id]
+
+    await feed(press(TargetAct(a="none", id=campaign.id)))
+    assert await app.repo.campaign_targets(campaign.id) == []
+    await feed(press(TargetAct(a="all", id=campaign.id)))
+    assert len(await app.repo.campaign_targets(campaign.id)) == 2
+
+
+async def test_left_chat_cannot_be_checked(feed, app, session):
+    chat = await add_chat(feed, app, -102050)
+    await feed(membership(-102050, actor=STRANGER, new=left_member()))
+    campaign = await app.repo.create_campaign("R")
+    await feed(press(TargetAct(a="on", id=campaign.id, v=chat.id)))
+    assert await app.repo.campaign_targets(campaign.id) == []
+    assert session.calls(AnswerCallbackQuery)[-1].show_alert
+
+
+async def test_campaign_from_chat_has_chat_and_back_button(feed, app, session):
+    chat = await add_chat(feed, app, -102101)
+    await feed(press(ChatAct(a="new", id=chat.id)))
+    campaign = (await app.repo.list_campaigns(chat.id))[0]
+    data = button_data(last_markup(session))
+    assert Nav(to="chat", id=chat.id).pack() in data  # «« К чату»
+    assert Nav(to="tgt", id=campaign.id).pack() in data  # «💬 Чаты (1)»
+    await feed(press(CampAct(a="off", id=campaign.id)))  # действие на экране не теряет, откуда пришли
+    assert Nav(to="chat", id=chat.id).pack() in button_data(last_markup(session))
+    # Из списка рассылок «Назад» ведёт в список
+    await feed(press(Nav(to="camp", id=campaign.id, f=-1)))
+    assert Nav(to="camps").pack() in button_data(last_markup(session))
+
+
+async def test_start_requires_checked_chat(feed, app, session):
+    campaign = await app.repo.create_campaign("R")
+    await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
+    await app.repo.update_campaign(campaign.id, times=["12:00"])
+    await feed(press(CampAct(a="on", id=campaign.id)))
+    answer = session.calls(AnswerCallbackQuery)[-1]
+    assert answer.show_alert and "Отметьте чаты" in answer.text
+    assert not (await app.repo.get_campaign(campaign.id)).is_active
+
+
+async def test_forum_topic_is_set_per_chat(feed, dp, bot, app):
+    chat = await add_chat(feed, app, -102201)
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
+    await feed(press(TargetAct(a="thr", id=campaign.id, v=chat.id)))
+    assert await state_of(dp, bot) == Input.thread.state
+    await feed(private_message("https://t.me/c/1234567890/45"))
+    assert (await app.repo.campaign_targets(campaign.id))[0].link.thread_id == 45
+    assert await state_of(dp, bot) is None
+    await feed(press(TargetAct(a="clrthr", id=campaign.id, v=chat.id)))
+    assert (await app.repo.campaign_targets(campaign.id))[0].link.thread_id is None
+
+
+async def test_resume_paused_chat(feed, app, session):
+    chat = await add_chat(feed, app, -102301)
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
+    await app.repo.update_target(campaign.id, chat.id, paused=True, fail_count=5, last_error="boom")
+    await feed(press(Nav(to="tgt", id=campaign.id)))
+    assert TargetAct(a="resume", id=campaign.id, v=chat.id).pack() in button_data(last_markup(session))
+    await feed(press(TargetAct(a="resume", id=campaign.id, v=chat.id)))
+    target = (await app.repo.campaign_targets(campaign.id))[0]
+    assert target.deliverable and target.link.fail_count == 0
+    # То же — с экрана чата, для всех его рассылок сразу
+    await app.repo.update_target(campaign.id, chat.id, paused=True)
+    await feed(press(ChatAct(a="resume", id=chat.id)))
+    assert (await app.repo.campaign_targets(campaign.id))[0].deliverable
+
+
+# ---------------------------------------------------------------------- мои посты
+
+
+async def test_library_lists_posts_and_keeps_origin(feed, app, session):
+    first = await app.repo.create_campaign("Первая")
+    draft = await app.repo.create_campaign("Шаблон", kind=DRAFT)
+    await app.repo.add_post(first.id, kind="text", payload={"text": "Старый пост"})
+    post, _ = await app.repo.add_post(draft.id, kind="text", payload={"text": "Новый пост"})
+    await app.repo.add_post(draft.id, kind="text", payload={"text": "Второй в черновике"})
+    await feed(press(Nav(to="lib")))
+    text = owner_texts(session)[-1]
+    assert "Мои посты" in text and text.index("Новый пост") < text.index("Старый пост")
+    await feed(press(Nav(to="post", id=post.id, f=1)))
+    data = button_data(last_markup(session))
+    assert Nav(to="lib").pack() in data  # назад — в «Мои посты»
+    assert LibAct(a="new", id=post.id, f=1).pack() in data
+    await feed(press(PostAct(a="down", id=post.id, f=1)))  # действие на карточке не теряет, откуда пришли
+    assert Nav(to="lib").pack() in button_data(last_markup(session))
+
+
+async def test_new_campaign_from_post(feed, app, session):
+    source = await app.repo.create_campaign("Первая")
+    buttons = [[{"text": "a", "url": "https://a.ru"}]]
+    post, _ = await app.repo.add_post(source.id, kind="text", payload={"text": "Пост"}, buttons=buttons)
+    await feed(press(LibAct(a="new", id=post.id, f=1)))
+    campaigns = await app.repo.list_campaigns()
+    assert len(campaigns) == 2
+    posts = await app.repo.list_posts(campaigns[-1].id)
+    assert [p.payload["text"] for p in posts] == ["Пост"] and posts[0].buttons == buttons
+    assert "Чаты рассылки" in owner_texts(session)[-1]
+    assert len(await app.repo.list_posts(source.id)) == 1  # исходный пост на месте
+
+
+async def test_copy_post_to_other_campaign(feed, app, session):
+    source = await app.repo.create_campaign("Первая")
+    target = await app.repo.create_campaign("Вторая")
+    await app.repo.add_post(target.id, kind="text", payload={"text": "уже был"})
+    post, _ = await app.repo.add_post(source.id, kind="text", payload={"text": "Пост"})
+    await feed(press(LibAct(a="to", id=post.id, f=1)))
+    data = button_data(last_markup(session))
+    assert LibAct(a="cp", id=post.id, v=target.id, f=1).pack() in data
+    assert LibAct(a="cp", id=post.id, v=source.id, f=1).pack() not in data  # в свою же рассылку не предлагаем
+    await feed(press(LibAct(a="cp", id=post.id, v=target.id, f=1)))
+    assert [p.payload["text"] for p in await app.repo.list_posts(target.id)] == ["уже был", "Пост"]
+    assert "пост #2" in owner_texts(session)[-1]
+
+
+async def test_new_post_from_library(feed, dp, bot, app, session):
+    await feed(press(Nav(to="lib")), press(LibAct(a="add", id=0)))
+    assert await state_of(dp, bot) == Input.posts.state
+    campaign = (await app.repo.list_campaigns())[0]
+    await feed(private_message("Свежий пост"))
+    reply = [c for c in session.calls(SendMessage) if c.text.startswith("✅ Пост #1")][-1]
+    assert reply.reply_markup.inline_keyboard[0][0].callback_data == CampAct(a="fin", id=campaign.id).pack()
+    await feed(press(CampAct(a="fin", id=campaign.id)))
+    assert await state_of(dp, bot) is None
+    assert [p.payload["text"] for p in await app.repo.list_posts(campaign.id)] == ["Свежий пост"]
+    assert "отметьте чаты" in owner_texts(session)[-1]
+
+
+async def test_cancel_new_post_removes_empty_campaign(feed, app, session):
+    await feed(press(LibAct(a="add", id=0)))
+    campaign = (await app.repo.list_campaigns())[0]
+    await feed(press(LibAct(a="drop", id=campaign.id)))
+    assert await app.repo.list_campaigns() == []
+    assert "Мои посты" in owner_texts(session)[-1]
+    # «Готово» без единого поста — тоже без пустой рассылки
+    await feed(press(LibAct(a="add", id=0)))
+    campaign = (await app.repo.list_campaigns())[0]
+    await feed(press(CampAct(a="fin", id=campaign.id)))
+    assert await app.repo.list_campaigns() == []
+
+
+async def test_delete_post_from_library_returns_to_library(feed, app, session):
+    campaign = await app.repo.create_campaign("R")
+    post, _ = await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
+    await feed(press(PostAct(a="del", id=post.id, f=1)), press(PostAct(a="del_ok", id=post.id, f=1)))
+    assert await app.repo.get_post(post.id) is None
+    assert "Мои посты" in owner_texts(session)[-1]
 
 
 # --------------------------------------------------------------------- навигация
@@ -386,6 +598,16 @@ async def test_nav_to_deleted_item_falls_back_to_menu(feed, session):
     assert "Автопостинг" in session.calls(EditMessageText)[-1].text
 
 
+async def test_buttons_from_previous_version_still_work(feed, app, session):
+    """Панели и уведомления, отправленные до обновления, несут кнопки без новых полей."""
+    await feed(press("n:chats:0:0"))
+    assert "Мои чаты" in owner_texts(session)[-1]
+    campaign = await app.repo.create_campaign("Старая")
+    post, _ = await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
+    await feed(press(f"n:camp:{campaign.id}:0"), press(f"p:del:{post.id}"))
+    assert "Удалить пост" in owner_texts(session)[-1]
+
+
 async def test_unknown_text_shows_hint(feed, session):
     await feed(private_message("привет"))
     assert any("Не понял" in text for text in owner_texts(session))
@@ -393,7 +615,7 @@ async def test_unknown_text_shows_hint(feed, session):
 
 async def test_cancel_clears_input(feed, dp, bot, app):
     chat = await add_chat(feed, app, -101400)
-    campaign = await app.repo.create_campaign(chat.id, "R")
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
     await feed(press(CampAct(a="rename", id=campaign.id)))
     assert await state_of(dp, bot) == Input.rename.state
     await feed(private_message("/cancel"))
@@ -412,6 +634,10 @@ def test_callback_data_fits_telegram_limit():
         ApplyDraft(chat=big, draft=big),
         PickAct(a="none", s=big, v=big),
         SetAct(a="backup", v=big),
+        TargetAct(a="resume", id=big, v=big, p=big),
+        LibAct(a="cp", id=big, v=big, f=big),
+        Nav(to="upcoming", id=big, page=big, f=-big),
+        PostAct(a="btndel", id=big, f=big),
     ]
     for sample in samples:
         assert len(sample.pack().encode()) <= 64, sample
