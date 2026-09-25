@@ -21,7 +21,7 @@ from bot.ui.render import finish_input, prompt, show
 router = Router(name="settings")
 router.message.filter(F.chat.type == "private")
 
-_OFFSET_RE = re.compile(r"^(?:utc|gmt)?\s*([+-−])\s*(\d{1,2})$", re.IGNORECASE)
+_OFFSET_RE = re.compile(r"^(?:utc|gmt)?([+\-−])(\d{1,2})$", re.IGNORECASE)
 
 
 def parse_timezone(text: str) -> str:
@@ -53,8 +53,14 @@ async def _set_timezone(app: App, name: str) -> None:
 
 
 @router.callback_query(SetAct.filter(F.a == "pause"))
-async def toggle_pause(callback: CallbackQuery, app: App, callback_answer: CallbackAnswer) -> None:
-    paused = not app.settings.paused_all
+async def toggle_pause(
+    callback: CallbackQuery, callback_data: SetAct, app: App, callback_answer: CallbackAnswer
+) -> None:
+    paused = bool(callback_data.v)
+    if paused == app.settings.paused_all:
+        callback_answer.text = "Уже на паузе" if paused else "Рассылки уже работают"
+        await show(app, callback, await screens.settings_view(app))
+        return
     await app.settings.set(app.repo, "paused_all", paused)
     if not paused and app.scheduler:
         # Отсчёт от текущего момента: пропущенные за паузу слоты не публикуются пачкой
@@ -64,8 +70,8 @@ async def toggle_pause(callback: CallbackQuery, app: App, callback_answer: Callb
 
 
 @router.callback_query(SetAct.filter(F.a == "notify"))
-async def toggle_notify(callback: CallbackQuery, app: App) -> None:
-    await app.settings.set(app.repo, "notify_errors", not app.settings.notify_errors)
+async def toggle_notify(callback: CallbackQuery, callback_data: SetAct, app: App) -> None:
+    await app.settings.set(app.repo, "notify_errors", bool(callback_data.v))
     await show(app, callback, await screens.settings_view(app))
 
 

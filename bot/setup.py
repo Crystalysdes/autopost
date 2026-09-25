@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from aiogram import Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 
 from bot.app import App
@@ -22,15 +21,19 @@ from bot.handlers import (
 )
 from bot.middlewares.access import AdminOnlyMiddleware
 from bot.middlewares.album import AlbumMiddleware
+from bot.middlewares.taps import DoubleTapMiddleware, ResetInputMiddleware
+from bot.storage import LeanMemoryStorage
 
 
-def build_dispatcher(app: App, *, album_latency: float = 0.8) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
+def build_dispatcher(app: App, *, album_latency: float = 0.8, double_tap_window: float = 1.5) -> Dispatcher:
+    dp = Dispatcher(storage=LeanMemoryStorage())
     dp["app"] = app
 
     access = AdminOnlyMiddleware(app.admin_ids)
     dp.message.outer_middleware(access)
     dp.callback_query.outer_middleware(access)
+    dp.callback_query.outer_middleware(DoubleTapMiddleware(window=double_tap_window))
+    dp.callback_query.outer_middleware(ResetInputMiddleware())
     dp.message.outer_middleware(AlbumMiddleware(latency=album_latency))
     dp.callback_query.middleware(CallbackAnswerMiddleware())
 

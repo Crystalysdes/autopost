@@ -136,12 +136,24 @@ class Scheduler:
     def plan(self, campaign: Campaign, after_ts: int) -> tuple[int | None, int | None]:
         return plan_next(spec_of(campaign), self.app.settings.tz, after_ts, self.now(), self.rng)
 
+    def reschedule_base(self, campaign: Campaign, now: int) -> int:
+        """С какого момента искать следующий слот при пересчёте (правка расписания, запуск, смена пояса…).
+
+        Слот, который уже ушёл раньше срока из-за разброса, повторно не планируем, а слот,
+        чей запуск с разбросом ещё впереди, не теряем.
+        """
+        if campaign.last_slot_ts is None:
+            return now
+        jitter = effective_jitter(campaign.times or [], campaign.jitter_min or 0) * 60
+        return max(campaign.last_slot_ts, now - jitter)
+
     async def reschedule(self, campaign_ids: Iterable[int] | None = None, *, only_missing: bool = False) -> None:
-        """Пересчёт от текущего момента: после правки расписания, запуска, смены пояса и т.п."""
         now = self.now()
-        finished = await self.app.repo.reschedule(lambda c: self.plan(c, now), campaign_ids, only_missing=only_missing)
-        for campaign in finished:
-            logger.info("Рассылка %s выключена: в расписании больше нет слотов", campaign.id)
+        stalled = await self.app.repo.reschedule(
+            lambda c: self.plan(c, self.reschedule_base(c, now)), campaign_ids, only_missing=only_missing
+        )
+        for campaign in stalled:
+            logger.info("Рассылка %s включена, но ближайших публикаций нет (дни/период)", campaign.id)
 
     # ------------------------------------------------------------------- цикл
 
@@ -178,6 +190,8 @@ class Scheduler:
     async def _process(self, campaign_id: int, run_ts: int) -> None:
         try:
             async with self._semaphore, self.lock(campaign_id):
+                if self.app.settings.paused_all:  # пока задача ждала очереди, всё могли поставить на паузу
+                    return
                 claim = await self.app.repo.claim_run(
                     campaign_id, run_ts, lambda c, posts: self._decide(c, posts, run_ts), self.now()
                 )
@@ -195,6 +209,9 @@ class Scheduler:
         # иначе разброс «+10 мин» съел бы соседний слот через 10 минут.
         base = now if overdue else (campaign.next_slot_ts or now)
         slot, run = self.plan(campaign, base)
+        if slot is not None and slot <= now:
+            # Запуск опоздал (например, бот перезапускался): прошедшие слоты не догоняем пачкой
+            slot, run = self.plan(campaign, now)
         post = None if overdue else pick_post(posts, campaign.last_post_id, campaign.rotation, self.rng)
         return ClaimDecision(next_slot_ts=slot, next_run_ts=run, post=post, skipped=overdue, finished=slot is None)
 
@@ -220,6 +237,8 @@ class Scheduler:
 
     async def send_now(self, campaign_id: int) -> tuple[bool, str]:
         """«Отправить сейчас»: следующий по очереди пост, расписание не меняется."""
+        if self.lock(campaign_id).locked():
+            return False, "Пост этой рассылки уже отправляется — подождите пару секунд"
         async with self.lock(campaign_id):
             repo = self.app.repo
             campaign = await repo.get_campaign(campaign_id)
@@ -262,12 +281,16 @@ class Scheduler:
         campaign, chat = delivery.campaign, delivery.chat
         tg_id = chat.tg_id
         post = PostData.of(delivery.post)
+        prev_ids = [i for i in (campaign.last_message_ids or []) if i]
         try:
             try:
                 result = await self._send(tg_id, post, campaign)
             except TelegramMigrateToChat as error:
                 await chat_service.migrate(self.app, tg_id, error.migrate_to_chat_id)
                 tg_id = error.migrate_to_chat_id
+                # Запись чата могла слиться с новой; id старых сообщений в супергруппе чужие
+                delivery.chat = chat = await self.app.repo.get_chat_by_tg(tg_id) or chat
+                prev_ids = []
                 result = await self._send(tg_id, post, campaign)
         except TelegramForbiddenError as error:
             await self._chat_lost(delivery, humanize(error))
@@ -290,7 +313,7 @@ class Scheduler:
             await self._failed(delivery, f"Непредвиденная ошибка: {error}")
             return None
 
-        warning = await self._after_send(tg_id, campaign, result)
+        warning = await self._after_send(tg_id, campaign, result, prev_ids)
         await self.app.repo.record_sent(
             campaign.id,
             chat.id,
@@ -305,18 +328,20 @@ class Scheduler:
             await self._notify_finished(campaign, chat)
         return result
 
-    async def _after_send(self, tg_id: int, campaign: Campaign, result: SendResult) -> str | None:
+    async def _after_send(self, tg_id: int, campaign: Campaign, result: SendResult, prev_ids: list[int]) -> str | None:
         bot = self.app.bot
         new_ids = result.usable_ids
-        prev_ids = [i for i in (campaign.last_message_ids or []) if i]
         warnings: list[str] = []
+        deleted = False
         if campaign.delete_prev and prev_ids:
             try:
                 await bot.delete_messages(chat_id=tg_id, message_ids=prev_ids)
+                deleted = True
             except TelegramAPIError as error:
                 # Старше 48 часов или уже удалено вручную — это не ошибка рассылки
                 logger.info("Не удалось удалить прошлый пост в %s: %s", tg_id, error)
-        elif campaign.pin and prev_ids:
+        if campaign.pin and prev_ids and not deleted:
+            # Прошлый пост остался в чате — снимаем с него закреп, чтобы закрепы не копились
             try:
                 await bot.unpin_chat_message(chat_id=tg_id, message_id=prev_ids[0])
             except TelegramAPIError as error:

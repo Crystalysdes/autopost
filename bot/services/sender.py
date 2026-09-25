@@ -13,7 +13,6 @@ from typing import Any
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
-    InputMediaAnimation,
     InputMediaAudio,
     InputMediaDocument,
     InputMediaLivePhoto,
@@ -21,6 +20,7 @@ from aiogram.types import (
     InputMediaVideo,
     Message,
 )
+from pydantic import ValidationError
 
 from bot.services.buttons import Rows, buttons_to_markup, has_icons
 from bot.services.content import CAPTION_TYPES, SPOILER_TYPES, load_entities, load_link_preview
@@ -41,7 +41,6 @@ _SEND_METHODS = {
 _INPUT_MEDIA = {
     "photo": InputMediaPhoto,
     "video": InputMediaVideo,
-    "animation": InputMediaAnimation,
     "document": InputMediaDocument,
     "audio": InputMediaAudio,
     "live_photo": InputMediaLivePhoto,
@@ -108,6 +107,9 @@ async def send_post(
 ) -> SendResult:
     try:
         return await _send(bot, chat_id, post, silent, protect, thread_id, with_icons=True)
+    except ValidationError as error:
+        # Пост из базы не собирается в запрос (например, старый формат) — это ошибка содержимого
+        raise PostSendError(f"Пост повреждён или устарел, замените его: {error.errors()[0]['msg']}") from error
     except TelegramBadRequest as error:
         # Иконки-премиум-эмодзи на кнопках доступны не всем ботам — пробуем без них.
         if post.buttons and has_icons(post.buttons) and _is_icon_error(error):

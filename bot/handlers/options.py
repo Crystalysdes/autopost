@@ -15,7 +15,7 @@ from bot.ui import screens
 from bot.ui import texts as t
 from bot.ui.callbacks import Nav, OptAct
 from bot.ui.keyboards import btn
-from bot.ui.render import finish_input, prompt, show
+from bot.ui.render import finish_input, input_value, prompt, show
 
 router = Router(name="options")
 router.message.filter(F.chat.type == "private")
@@ -50,7 +50,7 @@ async def toggle_option(
     if campaign is None:
         return await _gone(callback, app, callback_answer)
     field = TOGGLES[callback_data.a]
-    value = not getattr(campaign, field)
+    value = bool(callback_data.v)
     await app.repo.update_campaign(campaign.id, **{field: value})
     if field == "pin" and value and campaign.chat_id:
         chat = await app.repo.get_chat(campaign.chat_id)
@@ -90,7 +90,10 @@ async def ask_thread(
 
 @router.message(Input.thread, F.text)
 async def on_thread(message: Message, state: FSMContext, app: App) -> None:
-    campaign_id = int((await state.get_data())["camp_id"])
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     try:
         topic = parse_topic(message.text)
     except ValueError as error:

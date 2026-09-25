@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -19,7 +21,7 @@ from bot.ui import keyboards, screens
 from bot.ui import texts as t
 from bot.ui.callbacks import CampAct, Nav, PostAct
 from bot.ui.keyboards import GREEN, btn
-from bot.ui.render import finish_input, prompt, show
+from bot.ui.render import finish_input, input_value, prompt, show
 
 router = Router(name="posts")
 router.message.filter(F.chat.type == "private")
@@ -78,12 +80,17 @@ async def start_adding(
 
 
 @router.message(Input.posts)
-async def on_post_message(message: Message, state: FSMContext, app: App, album: list[Message] | None = None) -> None:
-    data = await state.get_data()
-    campaign_id = int(data["camp_id"])
-    if await app.repo.get_campaign(campaign_id) is None:
+async def on_post_message(
+    message: Message,
+    state: FSMContext,
+    app: App,
+    album: list[Message] | None = None,
+    fsm_snapshot: dict[str, Any] | None = None,
+) -> None:
+    campaign_id = await input_value(state, "camp_id", fsm_snapshot)
+    if campaign_id is None or await app.repo.get_campaign(campaign_id) is None:
         await state.clear()
-        await message.answer("Рассылка уже удалена.")
+        await message.answer("Не понял, в какую рассылку добавить пост. Откройте её и нажмите «➕ Добавить посты».")
         return
     try:
         captured = capture(message, album)
@@ -126,14 +133,14 @@ async def done_adding(
     await show(app, callback, screen)
 
 
-@router.callback_query(CampAct.filter(F.a == "rot"))
-async def toggle_rotation(
+@router.callback_query(CampAct.filter(F.a.in_({"rot_seq", "rot_rnd"})))
+async def set_rotation(
     callback: CallbackQuery, callback_data: CampAct, app: App, callback_answer: CallbackAnswer
 ) -> None:
     campaign = await app.repo.get_campaign(callback_data.id)
     if campaign is None:
         return await _gone(callback, app, callback_answer)
-    rotation = "random" if campaign.rotation == "sequential" else "sequential"
+    rotation = "random" if callback_data.a == "rot_rnd" else "sequential"
     await app.repo.update_campaign(campaign.id, rotation=rotation)
     callback_answer.text = "Порядок: " + ("случайно" if rotation == "random" else "по очереди")
     await show(app, callback, await screens.posts_view(app, campaign.id))
@@ -189,8 +196,8 @@ async def ask_buttons(
 
 @router.message(Input.buttons, F.text)
 async def on_buttons(message: Message, state: FSMContext, app: App) -> None:
-    data = await state.get_data()
-    post = await app.repo.get_post(int(data["post_id"]))
+    post_id = await input_value(state, "post_id")
+    post = await app.repo.get_post(post_id) if post_id is not None else None
     if post is None:
         await state.clear()
         await message.answer("Пост уже удалён.")
@@ -255,9 +262,15 @@ async def ask_replace(
 
 
 @router.message(Input.replace)
-async def on_replace(message: Message, state: FSMContext, app: App, album: list[Message] | None = None) -> None:
-    data = await state.get_data()
-    post = await app.repo.get_post(int(data["post_id"]))
+async def on_replace(
+    message: Message,
+    state: FSMContext,
+    app: App,
+    album: list[Message] | None = None,
+    fsm_snapshot: dict[str, Any] | None = None,
+) -> None:
+    post_id = await input_value(state, "post_id", fsm_snapshot)
+    post = await app.repo.get_post(post_id) if post_id is not None else None
     if post is None:
         await state.clear()
         await message.answer("Пост уже удалён.")
@@ -283,17 +296,15 @@ async def on_replace(message: Message, state: FSMContext, app: App, album: list[
     await show(app, message, await screens.post_view(app, post.id, note=note))
 
 
-@router.callback_query(PostAct.filter(F.a == "mode"))
-async def toggle_mode(
-    callback: CallbackQuery, callback_data: PostAct, app: App, callback_answer: CallbackAnswer
-) -> None:
+@router.callback_query(PostAct.filter(F.a.in_({"fwd", "copy"})))
+async def set_mode(callback: CallbackQuery, callback_data: PostAct, app: App, callback_answer: CallbackAnswer) -> None:
     post = await app.repo.get_post(callback_data.id)
     if post is None:
         return await _gone(callback, app, callback_answer)
     if not post.forward_from:
         callback_answer.text = "Пересылка доступна только для пересланных постов"
         return
-    mode = "copy" if post.send_mode == "forward" else "forward"
+    mode = "forward" if callback_data.a == "fwd" else "copy"
     await app.repo.update_post(post.id, send_mode=mode)
     callback_answer.text = "Режим: пересылка" if mode == "forward" else "Режим: копия"
     note = None

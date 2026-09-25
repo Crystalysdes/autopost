@@ -43,7 +43,12 @@ async def on_pick(
     selected = {int(x) for x in data.get("sel", [])}
     action = callback_data.a
     if action == "go":
-        await _apply(callback, data, bool(callback_data.v), state, app, callback_answer)
+        # Сбрасываем выбор ДО первых обращений к базе: второй быстрый тап увидит устаревшее окно
+        # и не создаст рассылки повторно. Если применить не получится — выбор вернём.
+        await state.clear()
+        if not await _apply(callback, data, bool(callback_data.v), app, callback_answer):
+            await state.set_state(Picker.picking)
+            await state.set_data(data)
         return
     if action == "t":
         selected ^= {callback_data.v}
@@ -74,22 +79,21 @@ async def _apply(
     callback: CallbackQuery,
     data: dict[str, Any],
     activate: bool,
-    state: FSMContext,
     app: App,
     callback_answer: CallbackAnswer,
-) -> None:
+) -> bool:
+    """Применяет выбор. False — применить не вышло и окно выбора стоит оставить открытым."""
     source = await app.repo.get_campaign(int(data["src"]))
     if source is None:
-        await state.clear()
         callback_answer.text = "Источник уже удалён"
         await show(app, callback, await screens.main_menu(app))
-        return
+        return True
     eligible = set(await _eligible_chat_ids(app, data))
     selected = [chat_id for chat_id in data.get("sel", []) if chat_id in eligible]
     if not selected:
         callback_answer.text = "Отметьте хотя бы один чат"
         callback_answer.show_alert = True
-        return
+        return False
     posts = await app.repo.list_posts(source.id)
     now = app.scheduler.now() if app.scheduler else 0
     if activate:
@@ -97,7 +101,7 @@ async def _apply(
         if problems:
             callback_answer.text = problems[0] + " — или примените на паузе"
             callback_answer.show_alert = True
-            return
+            return False
 
     results = await app.repo.apply_template(source.id, selected, activate=activate, link=data["mode"] == "draft")
     chats = {c.id: c for c in await app.repo.list_chats()}
@@ -114,9 +118,9 @@ async def _apply(
             warnings.append("📌 Нет права закреплять: " + ", ".join(no_pin))
     if app.scheduler:
         await app.scheduler.reschedule([c.id for c, _ in results])
-    await state.clear()
     await show(
         app,
         callback,
         await screens.apply_summary(app, source.id, [(c.id, created) for c, created in results], warnings),
     )
+    return True

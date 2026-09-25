@@ -40,8 +40,12 @@ class SchedAct(CallbackData, prefix="s"):
 
 
 class OptAct(CallbackData, prefix="o"):
+    """v — значение, которое кнопка устанавливает (а не «переключить»): старая кнопка
+    из другой панели не должна выключать то, что уже включено."""
+
     a: str
     id: int
+    v: int = 0
 
 
 class ApplyDraft(CallbackData, prefix="a"):

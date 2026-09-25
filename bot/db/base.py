@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import event
+from sqlalchemy import Connection, event, inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.db.models import Base
@@ -18,6 +18,18 @@ def _set_sqlite_pragmas(dbapi_connection: Any, _record: Any) -> None:
     cursor.execute("PRAGMA busy_timeout=5000")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
+
+
+def _add_missing_columns(conn: Connection) -> None:
+    """Простая миграция вперёд: колонки, появившиеся в моделях после обновления бота,
+    дописываются в уже существующие таблицы. Новые колонки должны допускать NULL."""
+    inspector = inspect(conn)
+    for table in Base.metadata.sorted_tables:
+        existing = {column["name"] for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name not in existing:
+                column_type = column.type.compile(dialect=conn.dialect)
+                conn.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}')
 
 
 class Database:
@@ -40,6 +52,7 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(_add_missing_columns)
 
     def session(self) -> AsyncSession:
         return self.sessionmaker()

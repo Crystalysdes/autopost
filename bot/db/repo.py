@@ -218,6 +218,8 @@ class Repo:
             new = await s.scalar(select(Chat).where(Chat.tg_id == new_tg_id))
             if old is None:
                 return new
+            # id прошлых сообщений относятся к старой группе — в супергруппе это были бы чужие сообщения
+            await s.execute(update(Campaign).where(Campaign.chat_id == old.id).values(last_message_ids=[]))
             if new is None:
                 old.tg_id = new_tg_id
                 old.type = "supergroup"
@@ -571,6 +573,7 @@ class Repo:
             values: dict[str, Any] = {
                 "next_slot_ts": decision.next_slot_ts,
                 "next_run_ts": decision.next_run_ts,
+                "last_slot_ts": campaign.next_slot_ts,
                 "updated_ts": now,
             }
             if decision.post is not None:
@@ -681,15 +684,16 @@ class Repo:
         *,
         only_missing: bool = False,
     ) -> list[Campaign]:
-        """Пересчитывает next_run. Возвращает рассылки, которые пришлось выключить
-        (например, период уже закончился)."""
-        finished: list[Campaign] = []
+        """Пересчитывает next_run. Статус рассылок не меняет: если слотов нет (не выбраны дни,
+        период закончился), рассылка остаётся включённой без ближайших запусков — так правка
+        расписания не выключает её молча. Возвращает такие рассылки."""
+        stalled: list[Campaign] = []
         async with self.db.session() as s:
             query = select(Campaign).where(Campaign.chat_id.is_not(None))
             if campaign_ids is not None:
                 ids = list(campaign_ids)
                 if not ids:
-                    return finished
+                    return stalled
                 query = query.where(Campaign.id.in_(ids))
             if only_missing:
                 query = query.where(Campaign.is_active.is_(True), Campaign.next_run_ts.is_(None))
@@ -700,10 +704,9 @@ class Repo:
                 slot, run = planner(campaign)
                 campaign.next_slot_ts, campaign.next_run_ts = slot, run
                 if slot is None:
-                    campaign.is_active = False
-                    finished.append(campaign)
+                    stalled.append(campaign)
             await s.commit()
-        return finished
+        return stalled
 
     # ---------------------------------------------------------------------- logs
 

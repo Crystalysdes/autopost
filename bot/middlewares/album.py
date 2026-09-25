@@ -40,6 +40,10 @@ class AlbumMiddleware(BaseMiddleware):
 
         self._albums[key] = [event]
         self._last_seen[key] = loop.time()
+        # Пока ждём остальные части, админ может нажать «Готово» и сбросить ввод. Альбом отправлен
+        # до этого, поэтому запоминаем, куда его добавлять (обработчики смотрят сюда, если ввод уже сброшен).
+        state = data.get("state")
+        data["fsm_snapshot"] = await state.get_data() if state is not None else {}
         while True:
             await asyncio.sleep(self.latency)
             if loop.time() - self._last_seen[key] >= self.latency:

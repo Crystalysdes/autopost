@@ -17,7 +17,7 @@ from bot.services.buttons import Rows, buttons_from_markup
 
 CAPTION_LIMIT = 1024
 ALBUM_LIMIT = 10
-ALBUM_TYPES = {"photo", "video", "animation", "document", "audio", "live_photo"}
+ALBUM_TYPES = {"photo", "video", "document", "audio", "live_photo"}  # GIF альбомом отправить нельзя
 SPOILER_TYPES = {"photo", "video", "animation", "live_photo"}
 CAPTION_TYPES = {"photo", "video", "animation", "document", "audio", "voice", "live_photo"}
 
@@ -173,7 +173,7 @@ def _capture_album(messages: Sequence[Message]) -> Captured:
         _reject_unsupported(message)
         item = _media_item(message)
         if item["type"] not in ALBUM_TYPES:
-            raise ContentError("Этот тип файлов нельзя отправить альбомом.")
+            raise ContentError("GIF и такие файлы нельзя отправить альбомом — пришлите их по одному.")
         items.append(item)
     return Captured(kind="album", payload={"items": items}, forward_from=_forward_source(messages), buttons=None)
 

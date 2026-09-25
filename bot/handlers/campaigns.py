@@ -14,7 +14,7 @@ from bot.states import Input, Picker
 from bot.ui import screens
 from bot.ui import texts as t
 from bot.ui.callbacks import CampAct, Nav
-from bot.ui.render import finish_input, prompt, show
+from bot.ui.render import finish_input, input_value, prompt, show
 
 router = Router(name="campaigns")
 router.message.filter(F.chat.type == "private")
@@ -205,12 +205,15 @@ async def ask_rename(
 
 @router.message(Input.rename, F.text)
 async def on_rename(message: Message, state: FSMContext, app: App) -> None:
-    data = await state.get_data()
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     name = " ".join(message.text.split())
     if not name:
         await message.reply("Название не может быть пустым.")
         return
-    campaign = await app.repo.update_campaign(int(data["camp_id"]), name=name)
+    campaign = await app.repo.update_campaign(campaign_id, name=name)
     await finish_input(app, message, state)
     if campaign is None:
         await show(app, message, await screens.main_menu(app))

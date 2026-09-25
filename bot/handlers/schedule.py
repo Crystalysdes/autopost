@@ -16,7 +16,7 @@ from bot.ui import screens
 from bot.ui import texts as t
 from bot.ui.callbacks import Nav, SchedAct
 from bot.ui.keyboards import btn
-from bot.ui.render import finish_input, prompt, show
+from bot.ui.render import finish_input, input_value, prompt, show
 
 router = Router(name="schedule")
 router.message.filter(F.chat.type == "private")
@@ -69,7 +69,10 @@ async def ask_times(
 
 @router.message(Input.times, F.text)
 async def on_times(message: Message, state: FSMContext, app: App) -> None:
-    campaign_id = int((await state.get_data())["camp_id"])
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     try:
         times = su.parse_times(message.text)
     except su.ScheduleError as error:
@@ -123,7 +126,10 @@ async def ask_count(callback: CallbackQuery, callback_data: SchedAct, state: FSM
 
 @router.message(Input.count, F.text)
 async def on_count(message: Message, state: FSMContext, app: App) -> None:
-    campaign_id = int((await state.get_data())["camp_id"])
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     text = message.text.strip()
     if not text.isdigit() or not 1 <= int(text) <= su.MAX_TIMES:
         await message.reply(f"⚠️ Нужно число от 1 до {su.MAX_TIMES}.")
@@ -169,8 +175,11 @@ async def ask_window(callback: CallbackQuery, callback_data: SchedAct, state: FS
 
 @router.message(Input.window, F.text)
 async def on_window(message: Message, state: FSMContext, app: App) -> None:
-    data = await state.get_data()
-    campaign_id, count = int(data["camp_id"]), int(data["count"])
+    campaign_id = await input_value(state, "camp_id")
+    count = await input_value(state, "count")
+    if campaign_id is None or count is None:
+        await state.clear()
+        return
     try:
         times = su.spread_times(count, *su.parse_window(message.text))
     except su.ScheduleError as error:
@@ -192,7 +201,10 @@ async def toggle_weekday(
     if campaign is None or not 0 <= callback_data.v <= 6:
         return await _gone(callback, app, callback_answer)
     days = set(campaign.weekdays or [])
-    days ^= {callback_data.v}
+    if callback_data.w:
+        days.add(callback_data.v)
+    else:
+        days.discard(callback_data.v)
     await _save(app, campaign.id, weekdays=sorted(days))
     if not days:
         callback_answer.text = "Не выбрано ни одного дня — публикаций не будет"
@@ -216,9 +228,7 @@ async def cycle_jitter(
     campaign = await app.repo.get_campaign(callback_data.id)
     if campaign is None:
         return await _gone(callback, app, callback_answer)
-    steps = su.JITTER_STEPS
-    current = campaign.jitter_min if campaign.jitter_min in steps else 0
-    value = steps[(steps.index(current) + 1) % len(steps)]
+    value = callback_data.v if callback_data.v in su.JITTER_STEPS else 0
     await _save(app, campaign.id, jitter_min=value)
     callback_answer.text = f"Разброс: ±{value} мин" if value else "Разброс выключен"
     await _render(app, callback, campaign.id)
@@ -283,7 +293,10 @@ async def clear_date(
 
 @router.message(Input.start_date, F.text)
 async def on_start_date(message: Message, state: FSMContext, app: App) -> None:
-    campaign_id = int((await state.get_data())["camp_id"])
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     campaign = await app.repo.get_campaign(campaign_id)
     try:
         value = su.parse_date(message.text, _today(app))
@@ -300,7 +313,10 @@ async def on_start_date(message: Message, state: FSMContext, app: App) -> None:
 
 @router.message(Input.end_date, F.text)
 async def on_end_date(message: Message, state: FSMContext, app: App) -> None:
-    campaign_id = int((await state.get_data())["camp_id"])
+    campaign_id = await input_value(state, "camp_id")
+    if campaign_id is None:
+        await state.clear()
+        return
     campaign = await app.repo.get_campaign(campaign_id)
     try:
         value = su.parse_date(message.text, _today(app))

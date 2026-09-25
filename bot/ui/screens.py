@@ -85,6 +85,12 @@ def _pager(page: int, pages: int, make: Any) -> list[InlineKeyboardButton] | Non
     return row
 
 
+def _next_jitter(current: int) -> int:
+    steps = su.JITTER_STEPS
+    index = steps.index(current) if current in steps else 0
+    return steps[(index + 1) % len(steps)]
+
+
 def window_label(window: tuple[int, int]) -> str:
     start, end = window
     if start == end:
@@ -318,6 +324,8 @@ def _status_line(campaign: Campaign, chat: Chat | None, paused_all: bool) -> str
         return "⏸ остановлена"
     if paused_all:
         return "⏸ все рассылки на паузе (см. настройки)"
+    if campaign.next_run_ts is None:
+        return "⚠️ включена, но ближайших публикаций нет — проверьте время, дни и период"
     return "🟢 работает"
 
 
@@ -591,7 +599,8 @@ async def posts_view(app: App, campaign_id: int, page: int = 0) -> Screen | None
     rows.append([btn("➕ Добавить посты", CampAct(a="add", id=campaign.id), GREEN)])
     if len(posts) > 1:
         label = "🔀 Порядок: по очереди" if campaign.rotation == "sequential" else "🔀 Порядок: случайно"
-        rows.append([btn(label, CampAct(a="rot", id=campaign.id))])
+        target = "rot_rnd" if campaign.rotation == "sequential" else "rot_seq"
+        rows.append([btn(label, CampAct(a=target, id=campaign.id))])
     rows.append(back("camp", campaign.id))
     return "\n".join(lines), markup(*rows)
 
@@ -640,7 +649,7 @@ async def post_view(app: App, post_id: int, note: str | None = None) -> Screen |
             [
                 btn(
                     "📋 Сделать копией" if forward else "↪️ Публиковать пересылкой",
-                    PostAct(a="mode", id=post.id),
+                    PostAct(a="copy" if forward else "fwd", id=post.id),
                 )
             ]
         )
@@ -694,7 +703,10 @@ async def schedule_view(app: App, campaign_id: int, note: str | None = None) -> 
     cid = campaign.id
     selected = set(campaign.weekdays or [])
     day_buttons = [
-        btn(("✅" if day in selected else "▫️") + t.WEEKDAYS_SHORT[day], SchedAct(a="wd", id=cid, v=day))
+        btn(
+            ("✅" if day in selected else "▫️") + t.WEEKDAYS_SHORT[day],
+            SchedAct(a="wd", id=cid, v=day, w=0 if day in selected else 1),
+        )
         for day in range(7)
     ]
     start = t.fmt_date(campaign.start_date)[:5] if campaign.start_date else "—"
@@ -714,7 +726,7 @@ async def schedule_view(app: App, campaign_id: int, note: str | None = None) -> 
         [
             btn(
                 f"🎲 Разброс: {'±' + str(campaign.jitter_min) + ' мин' if campaign.jitter_min else 'нет'}",
-                SchedAct(a="jit", id=cid),
+                SchedAct(a="jit", id=cid, v=_next_jitter(campaign.jitter_min)),
             )
         ],
         [
@@ -791,10 +803,15 @@ async def options_view(app: App, campaign_id: int, note: str | None = None) -> S
 
     cid = campaign.id
     rows: list[list[InlineKeyboardButton] | None] = [
-        [btn(f"🔕 Без звука: {mark(campaign.silent)}", OptAct(a="silent", id=cid))],
-        [btn(f"🔒 Защита: {mark(campaign.protect)}", OptAct(a="protect", id=cid))],
-        [btn(f"📌 Закреплять: {mark(campaign.pin)}", OptAct(a="pin", id=cid))],
-        [btn(f"🗑 Удалять прошлый: {mark(campaign.delete_prev)}", OptAct(a="delprev", id=cid))],
+        [btn(f"🔕 Без звука: {mark(campaign.silent)}", OptAct(a="silent", id=cid, v=int(not campaign.silent)))],
+        [btn(f"🔒 Защита: {mark(campaign.protect)}", OptAct(a="protect", id=cid, v=int(not campaign.protect)))],
+        [btn(f"📌 Закреплять: {mark(campaign.pin)}", OptAct(a="pin", id=cid, v=int(not campaign.pin)))],
+        [
+            btn(
+                f"🗑 Удалять прошлый: {mark(campaign.delete_prev)}",
+                OptAct(a="delprev", id=cid, v=int(not campaign.delete_prev)),
+            )
+        ],
     ]
     if chat is not None and chat.is_forum:
         topic = f"#{campaign.thread_id}" if campaign.thread_id else "General"
@@ -925,11 +942,16 @@ async def settings_view(app: App, note: str | None = None) -> Screen:
     rows = [
         [btn("🌍 Часовой пояс", Nav(to="tz"))],
         [
-            btn("▶️ Возобновить все рассылки", SetAct(a="pause"), GREEN)
+            btn("▶️ Возобновить все рассылки", SetAct(a="pause", v=0), GREEN)
             if paused
-            else btn("⏸ Поставить все на паузу", SetAct(a="pause"), RED)
+            else btn("⏸ Поставить все на паузу", SetAct(a="pause", v=1), RED)
         ],
-        [btn(f"🔔 Уведомления: {'вкл' if app.settings.notify_errors else 'выкл'}", SetAct(a="notify"))],
+        [
+            btn(
+                f"🔔 Уведомления: {'вкл' if app.settings.notify_errors else 'выкл'}",
+                SetAct(a="notify", v=int(not app.settings.notify_errors)),
+            )
+        ],
         [btn("💾 Резервная копия", SetAct(a="backup"))],
         back("main", text="« Меню"),
     ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from typing import Any
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -62,6 +63,15 @@ async def prompt(
     message_id = await show(app, event, (text, markup(*rows)))
     await state.set_state(new_state)
     await state.update_data(prompt_id=message_id, **data)
+
+
+async def input_value(state: FSMContext, key: str, snapshot: dict[str, Any] | None = None) -> int | None:
+    """Число из данных текущего ввода. Если ввод уже сброшен (например, «Готово» нажали, пока бот
+    собирал альбом), берётся снимок, сделанный до этого. None — вводить больше некуда."""
+    value = (await state.get_data()).get(key)
+    if value is None and snapshot:
+        value = snapshot.get(key)
+    return int(value) if value is not None else None
 
 
 async def finish_input(app: App, message: Message, state: FSMContext) -> None:

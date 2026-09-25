@@ -49,13 +49,24 @@ async def on_chat_shared(message: Message, app: App) -> None:
         await show(app, message, screen)
 
 
+async def _not_pending(callback: CallbackQuery, app: App, callback_answer: CallbackAnswer, chat_id: int) -> None:
+    """Кнопки «Принять»/«Выйти» из уведомления устарели: чат уже принят (например, другим админом)
+    или бота в нём нет. Ничего не делаем, просто показываем чат."""
+    chat = await app.repo.get_chat(chat_id)
+    callback_answer.text = "Бота уже нет в этом чате" if chat and chat.status == "left" else "Чат уже принят"
+    await show(app, callback, await screens.chat_view(app, chat_id) or await screens.chats_list(app))
+
+
 @router.callback_query(ChatAct.filter(F.a == "accept"))
 async def accept_chat(
     callback: CallbackQuery, callback_data: ChatAct, app: App, callback_answer: CallbackAnswer
 ) -> None:
-    chat = await app.repo.set_chat_status(callback_data.id, "active")
+    chat = await app.repo.get_chat(callback_data.id)
     if chat is None:
         return await _gone(callback, app, callback_answer)
+    if chat.status != "pending":
+        return await _not_pending(callback, app, callback_answer, chat.id)
+    await app.repo.set_chat_status(chat.id, "active")
     callback_answer.text = "✅ Чат принят"
     await show(app, callback, await screens.chat_view(app, chat.id))
 
@@ -67,6 +78,10 @@ async def leave_chat(
     chat = await app.repo.get_chat(callback_data.id)
     if chat is None:
         return await _gone(callback, app, callback_answer)
+    # «Выйти» из уведомления работает только для неподтверждённого чата; удаление принятого
+    # чата идёт через экран подтверждения («delleave»)
+    if callback_data.a == "leave" and chat.status != "pending":
+        return await _not_pending(callback, app, callback_answer, chat.id)
     with contextlib.suppress(TelegramAPIError):
         await app.bot.leave_chat(chat.tg_id)
     await app.repo.delete_chat(chat.id)

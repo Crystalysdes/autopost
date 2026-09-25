@@ -70,6 +70,8 @@ class Campaign(Base):
 
     # Состояние
     next_slot_ts: Mapped[int | None] = mapped_column(default=None)
+    # Базовый слот последнего запуска: от него считается следующий при пересчёте расписания
+    last_slot_ts: Mapped[int | None] = mapped_column(default=None)
     next_run_ts: Mapped[int | None] = mapped_column(default=None, index=True)
     last_post_id: Mapped[int | None] = mapped_column(default=None)
     last_message_ids: Mapped[list[int]] = mapped_column(JSON, default=list)

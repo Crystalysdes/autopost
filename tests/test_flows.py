@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 from aiogram import Dispatcher
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 from aiogram.types import (
     CallbackQuery,
@@ -26,6 +25,7 @@ from aiogram.types import (
 from bot.services.scheduler import Scheduler
 from bot.setup import build_dispatcher
 from bot.states import Input
+from bot.storage import LeanMemoryStorage
 from bot.ui.callbacks import ApplyDraft, CampAct, ChatAct, Nav, OptAct, PickAct, PostAct, SchedAct, SetAct
 from tests.conftest import BOT_ID, OWNER_ID, SECOND_ADMIN_ID, STRANGER_ID, FakeClock, admin_member, left_member
 
@@ -108,9 +108,10 @@ def dp(app, clock) -> Dispatcher:
     global _DISPATCHER
     app.scheduler = Scheduler(app, clock=clock, rng=random.Random(0))
     if _DISPATCHER is None:
-        _DISPATCHER = build_dispatcher(app, album_latency=0.05)
+        # защиту от двойных тапов проверяем отдельно — здесь кнопки жмутся подряд намеренно
+        _DISPATCHER = build_dispatcher(app, album_latency=0.05, double_tap_window=0)
     _DISPATCHER["app"] = app
-    _DISPATCHER.fsm.storage = MemoryStorage()
+    _DISPATCHER.fsm.storage = LeanMemoryStorage()
     return _DISPATCHER
 
 
@@ -246,7 +247,7 @@ async def test_full_campaign_flow(feed, dp, bot, app, session, clock):
     campaign = await app.repo.get_campaign(campaign.id)
     assert campaign.times == ["09:00", "18:00"]
 
-    await feed(press(OptAct(a="silent", id=campaign.id)), press(CampAct(a="on", id=campaign.id)))
+    await feed(press(OptAct(a="silent", id=campaign.id, v=1)), press(CampAct(a="on", id=campaign.id)))
     campaign = await app.repo.get_campaign(campaign.id)
     assert campaign.is_active and campaign.silent and campaign.next_run_ts
 
