@@ -230,6 +230,37 @@ def auto_paused_text(name: str, failures: Sequence[tuple[str, str]], fails: int)
     )
 
 
+def sub_notice_text(name_html: str, channels: Sequence[str]) -> str:
+    """name_html — уже готовая ссылка на человека."""
+    if len(channels) == 1:
+        target = f"на канал «{esc(channels[0], 60)}»"
+    else:
+        target = "на каналы: " + ", ".join(f"«{esc(title, 40)}»" for title in channels)
+    return f"👋 {name_html}, чтобы писать в этом чате, подпишитесь {target} и нажмите «✅ Я подписался»."
+
+
+def no_delete_right_text(title: str) -> str:
+    return (
+        f"🛡 Защита в «<b>{esc(title)}</b>» не работает: у бота нет права «Удаление сообщений».\n\n"
+        "Выдайте его в настройках администраторов чата — спам и сообщения без подписки снова начнут удаляться."
+    )
+
+
+def sub_check_failed_text(channel_title: str, reason: str) -> str:
+    return (
+        f"🔒 Не получается проверить подписку на «<b>{esc(channel_title)}</b>»: {esc(reason, 200)}.\n\n"
+        "Пока это так, писать в чатах можно и без подписки на него. Бот должен быть администратором канала."
+    )
+
+
+def no_invite_link_text(channel_title: str) -> str:
+    return (
+        f"🔒 У закрытого канала «<b>{esc(channel_title)}</b>» нет ссылки для подписки: боту не хватает права "
+        "«Пригласительные ссылки». Выдайте его или сделайте канал публичным — иначе в подсказке не будет кнопки "
+        "«📢 Подписаться»."
+    )
+
+
 def finished_text(name: str) -> str:
     return f"🏁 Рассылка «<b>{esc(name)}</b>» завершена: период публикаций закончился."
 

@@ -23,6 +23,7 @@ from bot.db.base import Database
 from bot.db.repo import Repo
 from bot.handlers.common import setup_commands
 from bot.services.chats import refresh_all
+from bot.services.moderation import Moderator
 from bot.services.scheduler import Scheduler
 from bot.setup import build_dispatcher
 
@@ -89,6 +90,7 @@ async def run(config: Config) -> None:
         bot_username=me.username or "",
     )
     app.scheduler = Scheduler(app)
+    app.moderator = Moderator(app)
     dp = build_dispatcher(app)
     app.commands_ready = await setup_commands(bot, config.admin_ids)
 
@@ -106,6 +108,7 @@ async def run(config: Config) -> None:
         refresh_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(scheduler_task, refresh_task, return_exceptions=True)
+        await app.moderator.close()
         await db.close()
         await bot.session.close()
 

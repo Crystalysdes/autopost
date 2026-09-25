@@ -38,6 +38,14 @@ class Chat(Base):
     is_admin: Mapped[bool] = mapped_column(default=False)
     can_post: Mapped[bool] = mapped_column(default=False)
     can_pin: Mapped[bool] = mapped_column(default=False)
+    can_delete: Mapped[bool | None] = mapped_column(default=None)  # удалять чужие сообщения (для защиты)
+    can_invite: Mapped[bool | None] = mapped_column(default=None)  # создавать ссылки-приглашения
+    invite_link: Mapped[str | None] = mapped_column(String(128), default=None)  # закрытый канал: ссылка
+    # Защита группы. Антиспам: None — включён со всеми правилами, иначе {"on": bool, "<правило>": bool}.
+    spam_filter: Mapped[dict[str, bool] | None] = mapped_column(JSON, default=None)
+    # Обязательная подписка: None — общие каналы из настроек, "own" — свои (sub_channels), "off" — выключена
+    sub_mode: Mapped[str | None] = mapped_column(String(8), default=None)
+    sub_channels: Mapped[list[int] | None] = mapped_column(JSON, default=None)
     added_by: Mapped[int | None] = mapped_column(BigInteger, default=None)
     created_ts: Mapped[int] = mapped_column(default=now_ts)
     updated_ts: Mapped[int] = mapped_column(default=now_ts, onupdate=now_ts)
@@ -143,6 +151,21 @@ class SendLog(Base):
     manual: Mapped[bool] = mapped_column(default=False)
     error: Mapped[str | None] = mapped_column(Text, default=None)
     message_ids: Mapped[list[int] | None] = mapped_column(JSON, default=None)
+    ts: Mapped[int] = mapped_column(default=now_ts, index=True)
+
+
+class ModerationLog(Base):
+    """Сообщение, удалённое защитой группы. Хранится две недели — для статистики и проверки ошибок."""
+
+    __tablename__ = "moderation_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    user_name: Mapped[str] = mapped_column(String(128), default="")
+    # links | bots | forwards | channels | words | contacts | names | service — антиспам; sub — нет подписки
+    reason: Mapped[str] = mapped_column(String(16))
+    snippet: Mapped[str | None] = mapped_column(Text, default=None)
     ts: Mapped[int] = mapped_column(default=now_ts, index=True)
 
 

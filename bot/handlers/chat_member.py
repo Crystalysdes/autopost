@@ -19,6 +19,8 @@ async def on_my_chat_member(event: ChatMemberUpdated, app: App) -> None:
     chat = change.chat
     if chat is None:
         return
+    if app.moderator is not None:  # права или статус чата поменялись — защита видит это сразу
+        app.moderator.forget(chat.tg_id)
 
     if change.status == "left":
         if change.prev_status in ("active", "pending"):

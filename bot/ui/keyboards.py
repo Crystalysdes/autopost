@@ -14,7 +14,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from bot.ui.callbacks import CampAct, ChatAct, Nav
+from bot.ui.callbacks import CampAct, ChatAct, Guard, Nav, SubCheck
 
 GREEN, RED, BLUE = "success", "danger", "primary"
 
@@ -74,6 +74,17 @@ def chat_back(chat_id: int, stopped: int) -> InlineKeyboardMarkup:
     return markup(start if stopped else None, [btn("⚙️ Открыть чат", Nav(to="chat", id=chat_id))])
 
 
+def sub_notice(channels: Sequence[tuple[str, str | None]], user_id: int) -> InlineKeyboardMarkup:
+    """Под подсказкой неподписанному: ссылки на каналы и проверка подписки."""
+    rows = [[url_btn(f"📢 {title[:40]}", url)] for title, url in channels[:5] if url]
+    rows.append([btn("✅ Я подписался", SubCheck(u=user_id), GREEN)])
+    return markup(*rows)
+
+
+def open_sub_settings() -> InlineKeyboardMarkup:
+    return markup([btn("🔒 Настройки подписки", Guard(a="sub"))])
+
+
 def campaign_problem(campaign_id: int) -> InlineKeyboardMarkup:
     return markup(
         [btn("💬 Чаты рассылки", Nav(to="tgt", id=campaign_id), BLUE)],
@@ -108,7 +119,10 @@ def _rights(**enabled: bool) -> ChatAdministratorRights:
 def add_chat_reply() -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: нативный выбор чата. Telegram сам добавит бота админом с нужными правами."""
     group_rights = _rights(can_delete_messages=True, can_pin_messages=True)
-    channel_rights = _rights(can_post_messages=True, can_edit_messages=True, can_delete_messages=True)
+    # Пригласительные ссылки — чтобы в подсказке об обязательной подписке была кнопка на закрытый канал
+    channel_rights = _rights(
+        can_post_messages=True, can_edit_messages=True, can_delete_messages=True, can_invite_users=True
+    )
     return ReplyKeyboardMarkup(
         keyboard=[
             [
@@ -147,4 +161,4 @@ def add_group_link(bot_username: str) -> str:
 
 
 def add_channel_link(bot_username: str) -> str:
-    return f"https://t.me/{bot_username}?startchannel&admin=post_messages+edit_messages+delete_messages"
+    return f"https://t.me/{bot_username}?startchannel&admin=post_messages+edit_messages+delete_messages+invite_users"

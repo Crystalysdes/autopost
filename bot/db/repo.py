@@ -19,7 +19,7 @@ from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.base import Database
-from bot.db.models import ALL_WEEKDAYS, Campaign, CampaignChat, Chat, Post, SendLog, Setting, now_ts
+from bot.db.models import ALL_WEEKDAYS, Campaign, CampaignChat, Chat, ModerationLog, Post, SendLog, Setting, now_ts
 
 CAMPAIGN, DRAFT = "campaign", "draft"
 
@@ -39,6 +39,8 @@ TEMPLATE_FIELDS = (
 POST_FIELDS = ("kind", "payload", "buttons", "forward_from", "send_mode")
 
 NAME_LIMIT = 64
+GROUP_TYPES = ("group", "supergroup")
+MODERATION_KEEP_SECONDS = 14 * 24 * 3600  # журнал удалённого защитой хранится две недели
 
 
 @dataclass
@@ -147,6 +149,7 @@ def _copy_post(post: Post, campaign_id: int, position: int) -> Post:
 class Repo:
     def __init__(self, db: Database) -> None:
         self.db = db
+        self._pruned_ts = 0  # когда последний раз чистили журнал защиты
 
     # ------------------------------------------------------------------ settings
 
@@ -158,6 +161,11 @@ class Repo:
     async def save_setting(self, key: str, value: str) -> None:
         async with self.db.session() as s:
             await s.merge(Setting(key=key, value=value))
+            await s.commit()
+
+    async def delete_setting(self, key: str) -> None:
+        async with self.db.session() as s:
+            await s.execute(delete(Setting).where(Setting.key == key))
             await s.commit()
 
     # --------------------------------------------------------------------- chats
@@ -207,6 +215,8 @@ class Repo:
         can_pin: bool,
         actor_id: int | None,
         admin_ids: Collection[int],
+        can_delete: bool = False,
+        can_invite: bool = False,
     ) -> ChatChange:
         """Бот вышел из чата — рассылки не трогаем: этот чат просто пропускается при публикации
         и возвращается в работу, когда бота добавят снова."""
@@ -228,6 +238,8 @@ class Repo:
             chat.is_admin = is_admin
             chat.can_post = can_post
             chat.can_pin = can_pin
+            chat.can_delete = can_delete
+            chat.can_invite = can_invite
             chat.status = status
             if prev in (None, "left") and in_chat:
                 chat.added_by = actor_id
@@ -290,6 +302,84 @@ class Repo:
             await s.delete(old)
             await s.commit()
             return new
+
+    # ------------------------------------------------------------ защита групп
+
+    async def update_chat(self, chat_id: int, **values: Any) -> Chat | None:
+        async with self.db.session() as s:
+            chat = await s.get(Chat, chat_id)
+            if chat is None:
+                return None
+            for key, value in values.items():
+                setattr(chat, key, value)
+            await s.commit()
+            return chat
+
+    async def set_spam_everywhere(self, on: bool) -> int:
+        """Включает или выключает антиспам во всех группах; выбранные правила не меняются."""
+        async with self.db.session() as s:
+            chats = list((await s.scalars(select(Chat).where(Chat.type.in_(GROUP_TYPES)))).all())
+            for chat in chats:
+                chat.spam_filter = {**(chat.spam_filter or {}), "on": on}
+            await s.commit()
+            return len(chats)
+
+    async def reset_sub_modes(self) -> int:
+        """Все группы переходят на общие каналы подписки (в том числе те, где подписка была выключена)."""
+        async with self.db.session() as s:
+            result = await s.execute(
+                update(Chat).where(Chat.type.in_(GROUP_TYPES), Chat.sub_mode.is_not(None)).values(sub_mode=None)
+            )
+            await s.commit()
+            return int(result.rowcount or 0)
+
+    async def log_moderation(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None,
+        user_name: str,
+        reason: str,
+        snippet: str | None,
+        now: int,
+    ) -> None:
+        async with self.db.session() as s:
+            if await s.get(Chat, chat_id) is None:  # чат удалили из бота, пока шла проверка
+                return
+            s.add(
+                ModerationLog(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_name=user_name[:128],
+                    reason=reason,
+                    snippet=snippet[:100] if snippet else None,
+                    ts=now,
+                )
+            )
+            if now - self._pruned_ts >= 3600:
+                self._pruned_ts = now
+                await s.execute(delete(ModerationLog).where(ModerationLog.ts < now - MODERATION_KEEP_SECONDS))
+            await s.commit()
+
+    async def moderation_counts(self, since_ts: int, chat_id: int | None = None) -> tuple[int, int]:
+        """(удалено спама, удалено сообщений без подписки) начиная с since_ts."""
+        async with self.db.session() as s:
+            query = select(ModerationLog.reason, func.count(ModerationLog.id)).where(ModerationLog.ts >= since_ts)
+            if chat_id is not None:
+                query = query.where(ModerationLog.chat_id == chat_id)
+            counts = {reason: int(count) for reason, count in await s.execute(query.group_by(ModerationLog.reason))}
+        sub = counts.pop("sub", 0)
+        return sum(counts.values()), sub
+
+    async def last_moderation(self, chat_id: int, limit: int = 10) -> list[ModerationLog]:
+        async with self.db.session() as s:
+            rows = await s.scalars(
+                select(ModerationLog)
+                .where(ModerationLog.chat_id == chat_id)
+                .order_by(ModerationLog.ts.desc(), ModerationLog.id.desc())
+                .limit(limit)
+            )
+            return list(rows.all())
 
     # ----------------------------------------------------------------- campaigns
 

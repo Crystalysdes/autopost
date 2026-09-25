@@ -24,6 +24,7 @@ from bot.ui.callbacks import (
     ApplyDraft,
     CampAct,
     ChatAct,
+    Guard,
     LibAct,
     Nav,
     OptAct,
@@ -33,6 +34,7 @@ from bot.ui.callbacks import (
     SetAct,
     TargetAct,
 )
+from bot.ui.guard import protection_label
 from bot.ui.keyboards import BLUE, GREEN, RED, add_channel_link, add_group_link, back, btn, markup, url_btn
 
 Screen = tuple[str, InlineKeyboardMarkup]
@@ -132,6 +134,9 @@ async def main_menu(app: App) -> Screen:
     if counts.get("failed"):
         sent_line += f" · ошибок: {counts['failed']}"
     lines.append(sent_line)
+    spam_today, sub_today = await app.repo.moderation_counts(t.day_start_ts(tz, now))
+    if spam_today or sub_today:
+        lines.append(f"🛡 Сегодня удалено: спам {spam_today} · без подписки {sub_today}")
     if upcoming and not app.settings.paused_all:
         campaign = upcoming[0]
         lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · «{t.esc(campaign.name, 30)}»")
@@ -229,9 +234,12 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
     else:
         post_mark = "✅" if chat.can_post else "❌"
         pin_mark = "✅" if chat.can_pin else "❌"
-        lines.append(f"Права бота: {post_mark} публикация · {pin_mark} закрепление")
+        delete_mark = "✅" if chat.can_delete else "❌"
+        lines.append(f"Права бота: {post_mark} публикация · {pin_mark} закрепление · {delete_mark} удаление")
         if not chat.can_post:
             lines.append("⚠️ Бот не может публиковать здесь — выдайте ему право «Публикация сообщений».")
+        if chat.type != "channel" and chat.can_delete is False:
+            lines.append("⚠️ Без права «Удаление сообщений» защита чата (антиспам, подписка) не работает.")
     lines.append("")
     if campaigns:
         lines.append(f"📬 Рассылок с этим чатом: <b>{len(campaigns)}</b>")
@@ -280,6 +288,8 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
     stopped = sum(1 for c in campaigns if not c.is_active)
     if chat.status == "active" and stopped:
         rows.append([btn(f"▶️ Запустить остановленные ({stopped})", ChatAct(a="resume", id=chat.id))])
+    if chat.type != "channel":
+        rows.append([btn(protection_label(chat, app.settings.sub_channels), Guard(a="chat", id=chat.id), BLUE)])
     rows.append(
         [
             btn("🔄 Обновить права", ChatAct(a="refresh", id=chat.id)),
@@ -1254,6 +1264,7 @@ async def settings_view(app: App, note: str | None = None) -> Screen:
         lines += ["", note]
     rows = [
         [btn("🌍 Часовой пояс", Nav(to="tz"))],
+        [btn("🛡 Антиспам", Guard(a="spam_set")), btn("🔒 Обязательная подписка", Guard(a="sub"))],
         [
             btn("▶️ Возобновить все рассылки", SetAct(a="pause", v=0), GREEN)
             if paused
@@ -1323,7 +1334,11 @@ def help_view() -> Screen:
         "во все отмеченные чаты.\n\n"
         "<b>3. Мои посты.</b> «🗂 Мои посты» — все посты из рассылок и черновиков. Пост можно открыть, "
         "изменить, скопировать в другую рассылку или сделать из него новую рассылку.\n\n"
-        "<b>4. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. «📤 Применить к чатам» "
+        "<b>4. Защита чатов.</b> Во всех группах бот молча удаляет спам: ссылки, пересылки, @ботов и @каналы, "
+        "рекламу от имени каналов, стоп-слова. «⚙️ Настройки → 🔒 Обязательная подписка» — писать смогут только "
+        "подписчики выбранных каналов. Правила чата — «🛡 Защита» на экране чата. Боту нужно право "
+        "«Удаление сообщений», а в каналах для подписки он должен быть админом.\n\n"
+        "<b>5. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. «📤 Применить к чатам» "
         "запускает черновик в нужных чатах. Изменили черновик — «🔄 Обновить рассылки».\n\n"
         "<b>Кнопки под постом</b> (одна строка — один ряд):\n"
         "<code>Текст - https://ссылка</code>\n"

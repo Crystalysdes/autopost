@@ -13,10 +13,13 @@ import pytest
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import (
+    CreateChatInviteLink,
     EditMessageText,
     ForwardMessages,
     GetChat,
+    GetChatAdministrators,
     GetChatMember,
     GetMe,
     SendAnimation,
@@ -36,6 +39,7 @@ from aiogram.types import (
     AcceptedGiftTypes,
     Chat,
     ChatFullInfo,
+    ChatInviteLink,
     ChatMemberAdministrator,
     ChatMemberLeft,
     Message,
@@ -131,9 +135,21 @@ class RecordingSession(BaseSession):
         if isinstance(method, EditMessageText):
             return self._message(method.chat_id, text=method.text)
         if isinstance(method, GetChat):
+            if isinstance(method.chat_id, str):  # «@ник» человека: getChat их не находит
+                raise TelegramBadRequest(method=method, message="Bad Request: chat not found")
             return chat_info(int(method.chat_id))
         if isinstance(method, GetChatMember):
             return admin_member()
+        if isinstance(method, GetChatAdministrators):
+            return []
+        if isinstance(method, CreateChatInviteLink):
+            return ChatInviteLink(
+                invite_link=f"https://t.me/+invite{method.chat_id}",
+                creator=User(id=BOT_ID, is_bot=True, first_name="Autopost"),
+                creates_join_request=False,
+                is_primary=False,
+                is_revoked=False,
+            )
         return True
 
 

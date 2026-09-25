@@ -17,6 +17,8 @@ class Input(StatesGroup):
     end_date = State()
     thread = State()
     timezone = State()
+    spam_words = State()
+    spam_allow = State()
 
 
 class Picker(StatesGroup):

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -16,6 +17,7 @@ from bot.db.base import Database
 from bot.db.repo import Repo
 
 if TYPE_CHECKING:
+    from bot.services.moderation import Moderator
     from bot.services.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,10 @@ class AppSettings:
         self.paused_all = False
         self.notify_errors = True
         self._tz = ZoneInfo(default_timezone)
+        # Защита групп (списки хранятся в settings как JSON)
+        self.spam_words: list[str] | None = None  # None — стандартный список из bot/services/spam.py
+        self.spam_allow: list[str] = []  # разрешённые ссылки: домены и @имена
+        self.sub_channels: list[int] = []  # общие каналы обязательной подписки (id записей чатов)
 
     @property
     def tz(self) -> ZoneInfo:
@@ -47,6 +53,23 @@ class AppSettings:
             self.paused_all = value == "1"
         elif key == "notify_errors":
             self.notify_errors = value == "1"
+        elif key in ("spam_words", "spam_allow", "sub_channels"):
+            self._apply_list(key, value)
+
+    def _apply_list(self, key: str, value: str) -> None:
+        try:
+            data = json.loads(value)
+        except ValueError:
+            data = None
+        if not isinstance(data, list):
+            logger.warning("Настройка %s в базе повреждена — использую значение по умолчанию", key)
+            return
+        if key == "spam_words":
+            self.spam_words = [str(item) for item in data]
+        elif key == "spam_allow":
+            self.spam_allow = [str(item) for item in data]
+        else:
+            self.sub_channels = [int(item) for item in data if isinstance(item, int)]
 
     async def load(self, repo: Repo) -> None:
         for key, value in (await repo.load_settings()).items():
@@ -56,6 +79,14 @@ class AppSettings:
         text = ("1" if value else "0") if isinstance(value, bool) else value
         await repo.save_setting(key, text)
         self._apply(key, text)
+
+    async def set_list(self, repo: Repo, key: str, value: list[Any]) -> None:
+        await self.set(repo, key, json.dumps(value, ensure_ascii=False))
+
+    async def reset_spam_words(self, repo: Repo) -> None:
+        """Вернуть стандартные стоп-слова (и получать их обновления вместе с ботом)."""
+        await repo.delete_setting("spam_words")
+        self.spam_words = None
 
 
 @dataclass
@@ -68,6 +99,7 @@ class App:
     bot_id: int = 0
     bot_username: str = ""
     scheduler: Scheduler | None = field(default=None, repr=False)
+    moderator: Moderator | None = field(default=None, repr=False)
     # Админы, которым уже установлено меню команд
     commands_ready: set[int] = field(default_factory=set)
     # Из какого чата админ открыл рассылку: туда ведёт «« Назад» (после перезапуска — к списку рассылок)

@@ -104,6 +104,20 @@ class TargetAct(CallbackData, prefix="t"):
     p: int = 0
 
 
+class Guard(CallbackData, prefix="m"):
+    """Защита групп: id — запись чата (0 — общие настройки), v — значение, которое ставит кнопка."""
+
+    a: str
+    id: int = 0
+    v: int = 0
+
+
+class SubCheck(CallbackData, prefix="v"):
+    """«✅ Я подписался» под подсказкой в группе. Нажать может любой участник; u — кому подсказка."""
+
+    u: int
+
+
 class LibAct(CallbackData, prefix="l"):
     """Действия с постом из «Моих постов»: id — пост, v — рассылка или страница, f — как у PostAct."""
 
