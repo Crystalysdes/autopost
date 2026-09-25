@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 import itertools
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import (
     AnswerCallbackQuery,
+    CreateChatInviteLink,
     DeleteMessage,
     DeleteMessages,
     GetChat,
@@ -22,9 +24,9 @@ from aiogram.methods import (
 )
 from aiogram.types import CallbackQuery, Chat, ChatMemberLeft, ChatMemberMember, Message, Update, User
 
-from bot.services.moderation import Moderator
+from bot.services.moderation import LINK_LIFETIME, NOTICE_LIFETIME, SUB_NO_TTL, Moderator, invite_name
 from bot.ui.callbacks import Nav, SubCheck
-from tests.conftest import BOT_ID, OWNER_ID, STRANGER_ID, admin_member, chat_info
+from tests.conftest import BOT_ID, OWNER_ID, STRANGER_ID, FakeClock, admin_member, chat_info
 from tests.test_flows import add_chat, clock, dp, feed  # noqa: F401
 
 STRANGER = User(id=STRANGER_ID, is_bot=False, first_name="Спамер")
@@ -40,6 +42,14 @@ def moderator(app):
     instance.notice_lifetime = 0  # подсказка удаляется сразу — тесты не ждут минуту
     app.moderator = instance
     yield instance
+
+
+def clocked(app, clock: FakeClock) -> Moderator:
+    """Модератор со своими часами — для проверок, где важно время (кэши, повтор подсказки)."""
+    instance = Moderator(app, clock=clock)
+    instance.notice_lifetime = 0
+    app.moderator = instance
+    return instance
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +92,31 @@ def deleted(session, chat_id: int = GROUP) -> list[int]:
 
 def group_sends(session, chat_id: int = GROUP) -> list[SendMessage]:
     return [call for call in session.calls(SendMessage) if call.chat_id == chat_id]
+
+
+def invites(session, chat_id: int = CHANNEL) -> list[CreateChatInviteLink]:
+    return [call for call in session.calls(CreateChatInviteLink) if call.chat_id == chat_id]
+
+
+def notice_links(notice: SendMessage) -> list[str]:
+    return [b.url for row in notice.reply_markup.inline_keyboard for b in row if b.url]
+
+
+def owner_warnings(session, needle: str) -> list[SendMessage]:
+    return [c for c in session.calls(SendMessage) if c.chat_id == OWNER_ID and needle in c.text]
+
+
+def notice_id_in_group(session, message_id: int) -> None:
+    """Подсказка в группе получит заданный id — чтобы проверить, что её удалили."""
+
+    def handler(method: SendMessage):
+        if method.chat_id != GROUP:
+            return session._default(method)
+        return Message(
+            message_id=message_id, date=datetime.now(), chat=Chat(id=GROUP, type="supergroup"), text=method.text
+        )
+
+    session.handlers[SendMessage] = handler
 
 
 def chat_admin(user: User):
@@ -237,12 +272,14 @@ def member_handler(subscribed: set[int], *, broken: bool = False):
     return handler
 
 
-async def setup_subscription(feed, app, moderator):
+async def setup_subscription(feed, app, moderator, *, can_invite: bool = True, **channel: Any):
+    """Группа и канал для подписки. По умолчанию у бота в канале есть право на ссылки-приглашения."""
     chat = await setup_group(feed, app)
-    channel = await add_chat(feed, app, CHANNEL, chat_type="channel")
-    await app.settings.set_list(app.repo, "sub_channels", [channel.id])
+    added = await add_chat(feed, app, CHANNEL, chat_type="channel")
+    await app.repo.update_chat(added.id, can_invite=can_invite, **channel)
+    await app.settings.set_list(app.repo, "sub_channels", [added.id])
     moderator.forget()
-    return chat, channel
+    return chat, await app.repo.get_chat(added.id)
 
 
 async def test_unsubscribed_member_gets_notice(feed, app, session, moderator):
@@ -257,14 +294,20 @@ async def test_unsubscribed_member_gets_notice(feed, app, session, moderator):
     notices = group_sends(session)
     assert len(notices) == 1 and "подпишитесь" in notices[0].text and f"tg://user?id={STRANGER_ID}" in notices[0].text
     buttons = [b for row in notices[0].reply_markup.inline_keyboard for b in row]
-    assert buttons[0].url == f"https://t.me/+invite{CHANNEL}"  # закрытый канал — ссылка-приглашение
+    assert buttons[0].url.startswith(f"https://t.me/+invite{CHANNEL}_")  # личная ссылка-приглашение
+    assert buttons[-1].text == "✅ Проверить подписку"
     assert buttons[-1].callback_data == SubCheck(u=STRANGER_ID).pack()
-    assert (await app.repo.get_chat(channel.id)).invite_link  # ссылка сохранена
+    (invite,) = invites(session)
+    assert invite.member_limit == 1 and invite.name == f"Спамер · {STRANGER_ID}"
+    expire = invite.expire_date.timestamp() if isinstance(invite.expire_date, datetime) else invite.expire_date
+    assert abs(expire - (time.time() + LINK_LIFETIME)) < 60
+    assert (await app.repo.get_chat(channel.id)).invite_link is None  # личные ссылки не хранятся
 
     second = group_msg(text="Ну и?")
     await feed(second)
     assert second.message.message_id in deleted(session)
-    assert len(group_sends(session)) == 1  # повторная подсказка — не сразу
+    assert len(group_sends(session)) == 1  # пока подсказка висит — удаляется молча
+    assert len(invites(session)) == 1
     assert await app.repo.moderation_counts(0, chat.id) == (0, 2)
 
     await feed(press_in_group(SubCheck(u=STRANGER_ID), STRANGER))
@@ -278,6 +321,122 @@ async def test_unsubscribed_member_gets_notice(feed, app, session, moderator):
     kept = group_msg(text="Теперь можно")
     await feed(kept)
     assert kept.message.message_id not in deleted(session)
+
+
+async def test_every_notice_gets_new_personal_links(feed, app, session, clock):
+    moderator = clocked(app, clock)
+    await setup_subscription(feed, app, moderator, username="our_channel")
+    session.handlers[GetChatMember] = member_handler(set())
+    session.clear()
+
+    await feed(group_msg(text="Первый"), group_msg(user=MEMBER, text="Второй"))
+    assert [call.name for call in invites(session)] == [f"Спамер · {STRANGER_ID}", f"Участник · {MEMBER.id}"]
+    links = [notice_links(notice) for notice in group_sends(session)]
+    assert len(links) == 2 and links[0] != links[1]
+    assert all(link[0].startswith("https://t.me/+invite") for link in links)  # и у публичного канала — личные
+
+    clock.advance(NOTICE_LIFETIME + 1)  # прошлая подсказка исчезла — следующая с новой ссылкой
+    await feed(group_msg(text="Снова"))
+    assert len(invites(session)) == 3
+    again = notice_links(group_sends(session)[-1])
+    assert len(group_sends(session)) == 3 and again[0] not in {links[0][0], links[1][0]}
+
+
+async def test_public_channel_without_invite_right_gets_plain_link(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator, can_invite=False, username="our_channel")
+    session.handlers[GetChatMember] = member_handler(set())
+    session.clear()
+    await feed(group_msg(text="Привет"), group_msg(user=MEMBER, text="И я"))
+    assert invites(session) == []  # права нет — Telegram не просим
+    assert [notice_links(notice) for notice in group_sends(session)] == [["https://t.me/our_channel"]] * 2
+    (warning,) = owner_warnings(session, "личные ссылки")  # раз в сутки, а не на каждого
+    assert "обычная ссылка" in warning.text
+
+
+async def test_private_channel_without_invite_right_has_no_link(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator, can_invite=False)
+    session.handlers[GetChatMember] = member_handler(set())
+    session.clear()
+    await feed(group_msg(text="Привет"))
+    (notice,) = group_sends(session)
+    assert notice_links(notice) == []
+    assert notice.reply_markup.inline_keyboard[-1][0].callback_data == SubCheck(u=STRANGER_ID).pack()
+    (warning,) = owner_warnings(session, "личные ссылки")
+    assert "нет кнопки" in warning.text
+
+
+async def test_flood_limit_falls_back_to_reserve_link(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator, invite_link="https://t.me/+reserve")
+    session.handlers[GetChatMember] = member_handler(set())
+
+    def flood(method: CreateChatInviteLink):
+        raise TelegramRetryAfter(method=method, message="Too Many Requests: retry after 30", retry_after=30)
+
+    session.handlers[CreateChatInviteLink] = flood
+    session.clear()
+    await feed(group_msg(text="Привет"), group_msg(user=MEMBER, text="И я"))
+    assert len(invites(session)) == 1  # на время паузы Telegram больше не просим
+    assert [notice_links(notice) for notice in group_sends(session)] == [["https://t.me/+reserve"]] * 2
+    assert owner_warnings(session, "личные ссылки") == []  # это ненадолго — админов не беспокоим
+
+
+async def test_refused_invite_link_pauses_until_rights_change(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator, username="our_channel")
+
+    def refuse(method: CreateChatInviteLink):
+        raise TelegramBadRequest(method=method, message="Bad Request: not enough rights to manage chat invite link")
+
+    session.handlers[GetChatMember] = member_handler(set())
+    session.handlers[CreateChatInviteLink] = refuse
+    session.clear()
+    await feed(group_msg(text="Привет"), group_msg(user=MEMBER, text="И я"))
+    assert len(invites(session)) == 1
+    assert [notice_links(notice) for notice in group_sends(session)] == [["https://t.me/our_channel"]] * 2
+    (warning,) = owner_warnings(session, "личные ссылки")
+    assert "not enough rights to manage chat invite link" in warning.text  # видно, что ответил Telegram
+
+    del session.handlers[CreateChatInviteLink]
+    moderator.forget(CHANNEL)  # права бота поменялись (my_chat_member) — пауза снимается
+    await feed(group_msg(user=User(id=3001, is_bot=False, first_name="Новый"), text="Здравствуйте"))
+    assert notice_links(group_sends(session)[-1])[0].startswith(f"https://t.me/+invite{CHANNEL}_")
+
+
+async def test_notice_disappears_when_member_subscribes_and_writes(feed, app, session, clock):
+    moderator = clocked(app, clock)
+    moderator.notice_lifetime = 60  # сама за время теста не исчезнет
+    await setup_subscription(feed, app, moderator)
+    subscribed: set[int] = set()
+    session.handlers[GetChatMember] = member_handler(subscribed)
+    notice_id_in_group(session, 9001)
+    await feed(group_msg(text="Привет"))
+    assert 9001 not in deleted(session)
+
+    subscribed.add(STRANGER_ID)
+    clock.advance(SUB_NO_TTL + 1)  # «не подписан» бот помнит недолго
+    kept = group_msg(text="Подписался, не нажимая кнопку")
+    await feed(kept)
+    assert kept.message.message_id not in deleted(session)
+    assert 9001 in deleted(session)  # подсказка исчезла
+
+
+async def test_live_notices_are_removed_on_shutdown(feed, app, session, moderator):
+    moderator.notice_lifetime = NOTICE_LIFETIME
+    await setup_subscription(feed, app, moderator)
+    session.handlers[GetChatMember] = member_handler(set())
+    notice_id_in_group(session, 9002)
+    await feed(group_msg(text="Привет"))
+    assert 9002 not in deleted(session)
+    await moderator.close()  # после перезапуска удалять её было бы некому
+    assert 9002 in deleted(session)
+
+
+def test_invite_name_fits_telegram_limit():
+    assert invite_name("Иван Петров", 6434205268) == "Иван Петров · 6434205268"
+    assert invite_name("Имя\nс  переносом", 7) == "Имя с переносом · 7"
+    assert invite_name("   ", 42) == "42"
+    long = invite_name("😀" * 40 + " Очень длинное имя", 10**15)
+    assert long.endswith(f" · {10**15}") and long.startswith("😀")
+    assert len(long.encode("utf-16-le")) // 2 <= 32
 
 
 async def test_other_member_pressing_does_not_remove_notice(feed, app, session, moderator):

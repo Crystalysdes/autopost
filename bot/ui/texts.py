@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 CHAT_TYPES = {"channel": "канал", "supergroup": "супергруппа", "group": "группа"}
 CHAT_ICONS = {"channel": "📢", "supergroup": "👥", "group": "👥"}
+# Право бота в канале на ссылки-приглашения: в разных версиях Telegram оно называется по-разному
+INVITE_RIGHT = "«Добавление подписчиков» («Пригласительные ссылки»)"
 
 
 def esc(value: object, limit: int | None = None) -> str:
@@ -236,7 +238,7 @@ def sub_notice_text(name_html: str, channels: Sequence[str]) -> str:
         target = f"на канал «{esc(channels[0], 60)}»"
     else:
         target = "на каналы: " + ", ".join(f"«{esc(title, 40)}»" for title in channels)
-    return f"👋 {name_html}, чтобы писать в этом чате, подпишитесь {target} и нажмите «✅ Я подписался»."
+    return f"👋 {name_html}, чтобы писать в этом чате, подпишитесь {target} и нажмите «✅ Проверить подписку»."
 
 
 def no_delete_right_text(title: str) -> str:
@@ -253,11 +255,23 @@ def sub_check_failed_text(channel_title: str, reason: str) -> str:
     )
 
 
-def no_invite_link_text(channel_title: str) -> str:
+def no_invite_link_text(channel_title: str, *, fallback: bool, error: str | None = None) -> str:
+    """fallback — есть ли обычная ссылка на канал (публичный канал или сохранённая общая ссылка);
+    error — ответ Telegram, если он отказал, хотя право вроде бы есть."""
+    if error:
+        reason = f"Telegram ответил «{esc(error, 200)}»"
+        fix = f"Проверьте, что бот — администратор канала с правом {INVITE_RIGHT}."
+    else:
+        reason = f"у бота нет права {INVITE_RIGHT}"
+        fix = "Выдайте его в настройках администраторов канала."
+    now = (
+        "Пока в подсказке обычная ссылка на канал вместо личной."
+        if fallback
+        else "Пока в подсказке нет кнопки на этот закрытый канал — без ссылки в него не вступить."
+    )
     return (
-        f"🔒 У закрытого канала «<b>{esc(channel_title)}</b>» нет ссылки для подписки: боту не хватает права "
-        "«Пригласительные ссылки». Выдайте его или сделайте канал публичным — иначе в подсказке не будет кнопки "
-        "«📢 Подписаться»."
+        f"🔒 Не получается создать личные ссылки-приглашения в канал «<b>{esc(channel_title)}</b>»: {reason}.\n\n"
+        f"{now} {fix}"
     )
 
 

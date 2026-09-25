@@ -153,10 +153,11 @@ async def toggle_channel(
         await app.settings.set_list(app.repo, "sub_channels", [*ids, callback_data.v] if on else ids)
     _forget(app)
     note = None
-    # Закрытому каналу нужна ссылка-приглашение для кнопки «📢 Подписаться» — проверяем сразу
-    private = on and channel is not None and not channel.username
-    if private and app.moderator is not None and await app.moderator.channel_link(channel) is None:
-        note = "⚠️ Не удалось создать ссылку на канал: дайте боту право «Пригласительные ссылки»."
+    # Закрытому каналу сразу создаём запасную общую ссылку: она нужна, если личную Telegram создать не даст.
+    # Если права на ссылки нет вовсе, экран каналов сам это покажет (guard.channel_problem).
+    private = on and channel is not None and not channel.username and channel.can_invite is not False
+    if private and app.moderator is not None and await app.moderator.reserve_link(channel) is None:
+        note = f"⚠️ Не удалось создать ссылку на канал: дайте боту право {t.INVITE_RIGHT}."
     await _channels(app, callback, callback_data.id, note)
 
 

@@ -142,13 +142,15 @@ class RecordingSession(BaseSession):
             return admin_member()
         if isinstance(method, GetChatAdministrators):
             return []
-        if isinstance(method, CreateChatInviteLink):
+        if isinstance(method, CreateChatInviteLink):  # каждый вызов — новая ссылка, как в Telegram
             return ChatInviteLink(
-                invite_link=f"https://t.me/+invite{method.chat_id}",
+                invite_link=f"https://t.me/+invite{method.chat_id}_{next(self._ids)}",
                 creator=User(id=BOT_ID, is_bot=True, first_name="Autopost"),
                 creates_join_request=False,
                 is_primary=False,
                 is_revoked=False,
+                name=method.name,
+                member_limit=method.member_limit,
             )
         return True
 

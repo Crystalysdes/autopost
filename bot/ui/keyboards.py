@@ -75,9 +75,9 @@ def chat_back(chat_id: int, stopped: int) -> InlineKeyboardMarkup:
 
 
 def sub_notice(channels: Sequence[tuple[str, str | None]], user_id: int) -> InlineKeyboardMarkup:
-    """Под подсказкой неподписанному: ссылки на каналы и проверка подписки."""
+    """Под подсказкой неподписанному: личные ссылки на каналы и проверка подписки."""
     rows = [[url_btn(f"📢 {title[:40]}", url)] for title, url in channels[:5] if url]
-    rows.append([btn("✅ Я подписался", SubCheck(u=user_id), GREEN)])
+    rows.append([btn("✅ Проверить подписку", SubCheck(u=user_id), GREEN)])
     return markup(*rows)
 
 
@@ -119,7 +119,7 @@ def _rights(**enabled: bool) -> ChatAdministratorRights:
 def add_chat_reply() -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: нативный выбор чата. Telegram сам добавит бота админом с нужными правами."""
     group_rights = _rights(can_delete_messages=True, can_pin_messages=True)
-    # Пригласительные ссылки — чтобы в подсказке об обязательной подписке была кнопка на закрытый канал
+    # Ссылки-приглашения — чтобы в подсказке об обязательной подписке у каждого была личная ссылка на канал
     channel_rights = _rights(
         can_post_messages=True, can_edit_messages=True, can_delete_messages=True, can_invite_users=True
     )

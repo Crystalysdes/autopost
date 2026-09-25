@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from aiogram.methods import AnswerCallbackQuery, DeleteMessage
+from aiogram.methods import AnswerCallbackQuery, CreateChatInviteLink, DeleteMessage
 from aiogram.types import Chat, Message, Update, User
 
 from bot.services.moderation import Moderator
@@ -110,6 +110,24 @@ async def test_subscription_modes_and_channels(feed, app, session, moderator):
     assert (await app.repo.get_chat(group.id)).sub_mode == "off"
     await feed(press(Guard(a="sub_reset")))
     assert (await app.repo.get_chat(group.id)).sub_mode is None
+
+
+async def test_private_channel_gets_reserve_link_or_warning(feed, app, session, moderator):
+    await add_chat(feed, app, GROUP)
+    with_right = await add_chat(feed, app, -1004000000903, chat_type="channel")
+    await app.repo.update_chat(with_right.id, can_invite=True)
+    await feed(press(Guard(a="con", id=0, v=with_right.id)))
+    # запасная общая ссылка — на случай, если личную Telegram создать не даст
+    assert (await app.repo.get_chat(with_right.id)).invite_link.startswith("https://t.me/+invite")
+    assert "Добавление подписчиков" not in owner_texts(session)[-1]
+
+    session.clear()
+    without_right = await add_chat(feed, app, -1004000000904, chat_type="channel")  # права на ссылки нет
+    await feed(press(Guard(a="con", id=0, v=without_right.id)))
+    assert session.calls(CreateChatInviteLink) == []
+    assert (await app.repo.get_chat(without_right.id)).invite_link is None
+    assert "нет права «Добавление подписчиков»" in owner_texts(session)[-1]
+    assert "в подсказке не будет кнопки" in owner_texts(session)[-1]
 
 
 async def test_unavailable_channel_cannot_be_checked(feed, app, session, moderator):

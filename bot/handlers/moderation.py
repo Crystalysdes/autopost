@@ -34,7 +34,8 @@ async def on_group_edit(message: Message, app: App) -> None:
 async def on_sub_check(
     callback: CallbackQuery, callback_data: SubCheck, app: App, callback_answer: CallbackAnswer
 ) -> None:
-    """«✅ Я подписался»: проверяет того, кто нажал. Подсказку убирает, только если она адресована ему."""
+    """«✅ Проверить подписку»: проверяет того, кто нажал, без кэша. Подписан — подсказка исчезает
+    (если она адресована ему) и можно писать."""
     notice = callback.message
     if app.moderator is None or not isinstance(notice, Message):
         callback_answer.text = "Подсказка устарела — просто напишите сообщение ещё раз"
@@ -42,10 +43,15 @@ async def on_sub_check(
     info = await app.moderator.chat_info(notice.chat.id)
     missing = await app.moderator.missing_channels(callback.from_user.id, info.channels, fresh=True) if info else []
     if missing:
-        callback_answer.text = "Вы ещё не подписаны на: " + ", ".join(f"«{c.title}»" for c in missing)
+        callback_answer.text = (
+            "Вы ещё не подписаны на: "
+            + ", ".join(f"«{c.title}»" for c in missing)
+            + ". Подпишитесь по кнопке в подсказке и нажмите «Проверить подписку» ещё раз."
+        )[:200]
         callback_answer.show_alert = True
         return
     callback_answer.text = "✅ Спасибо! Теперь можно писать"
     if callback.from_user.id == callback_data.u:
+        app.moderator.notice_done(notice.chat.id, callback.from_user.id)
         with contextlib.suppress(TelegramAPIError):
             await notice.delete()

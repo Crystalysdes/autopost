@@ -7,7 +7,8 @@
 1. служебные сообщения: вход/выход удаляются (если включено), остальные не трогаются;
 2. сразу пропускаются админы бота, анонимные админы чата и посты привязанного канала;
 3. антиспам: если сообщение похоже на спам и автор не админ чата — молча удалить;
-4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку.
+4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
+   с новыми личными ссылками-приглашениями на каналы.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.types import Message
+from aiogram.types import Message, User
 
 from bot.app import NO_PREVIEW, App
 from bot.db.models import Chat
@@ -51,8 +52,13 @@ MENTION_TTL = 24 * 3600
 SUB_YES_TTL = 15 * 60
 SUB_NO_TTL = 15  # короткий: человек подписался — через несколько секунд уже может писать
 ALBUM_TTL = 120
-NOTICE_LIFETIME = 60  # подсказка неподписанному удаляется сама
-NOTICE_INTERVAL = 120  # не чаще одной подсказки на человека в чате
+NOTICE_LIFETIME = 5 * 60  # подсказка неподписанному удаляется сама
+NOTICE_INTERVAL = NOTICE_LIFETIME  # одна подсказка на человека: пока она висит, новые сообщения удаляются молча
+MAX_NOTICE_CHANNELS = 5  # кнопок-ссылок на каналы в подсказке
+LINK_LIFETIME = 3600  # личная ссылка-приглашение: с запасом, чтобы успеть нажать «Вступить»
+LINK_RETRY = 600  # после отказа Telegram снова пробуем создавать личные ссылки на канал не раньше
+LINK_NAME_LIMIT = 32  # длина названия ссылки-приглашения в Telegram
+CLOSE_TIMEOUT = 5  # при остановке бота — на уборку висящих подсказок
 BACKLOG_SECONDS = 120  # сообщения старше (пришли, пока бот был выключен) удаляются без подсказки
 PROBLEM_INTERVAL = 24 * 3600  # одинаковые предупреждения админам — не чаще раза в сутки
 MAX_MENTION_CHECKS = 5  # @ников на одно сообщение, которые проверяем через Telegram
@@ -128,18 +134,22 @@ class Moderator:
         self._notices = TTLCache(clock)
         self._problems = TTLCache(clock)
         self._channels = TTLCache(clock)
+        self._link_pause = TTLCache(clock)  # каналы, где личные ссылки сейчас не создаются
+        self._live: set[tuple[int, int]] = set()  # висящие подсказки (чат, сообщение) — убрать при остановке
         self._words: tuple[tuple[str, ...], list[Any]] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------ настройки
 
     def forget(self, tg_id: int | None = None) -> None:
-        """Настройки защиты поменялись: перечитать их из базы при следующем сообщении."""
+        """Настройки защиты или права бота поменялись: перечитать их из базы при следующем сообщении."""
+        self._channels.clear()
         if tg_id is None:
             self._chats.clear()
-            self._channels.clear()
+            self._link_pause.clear()
         else:
             self._chats.pop(tg_id)
+            self._link_pause.pop(tg_id)  # боту выдали право на ссылки — личные ссылки снова создаются
 
     async def chat_info(self, tg_id: int) -> ChatInfo | None:
         cached = self._chats.get(tg_id)
@@ -188,6 +198,9 @@ class Moderator:
             user_id = message.from_user.id if message.from_user else 0
             if await self.missing_channels(user_id, info.channels):
                 reason = "sub"
+            elif notice_id := self.notice_done(info.tg_id, user_id):
+                # подписался и просто написал, не нажав «Проверить подписку», — подсказка больше не нужна
+                await self._delete_quietly(info.tg_id, notice_id, 0)
         if reason is None or await self._is_chat_admin(info, message):
             return
 
@@ -345,24 +358,53 @@ class Moderator:
                 missing.append(channel)
         return missing
 
-    async def channel_link(self, channel: Chat) -> str | None:
-        """Ссылка для кнопки «📢 Подписаться»: у публичного канала — t.me/ник, у закрытого —
-        ссылка-приглашение (создаётся один раз и хранится в базе)."""
-        if channel.username:
-            return f"https://t.me/{channel.username}"
-        if channel.invite_link:
-            return channel.invite_link
+    async def personal_link(self, channel: Chat, user: User) -> str | None:
+        """Новая ссылка-приглашение только для этого человека: вступить по ней может один, через час она
+        истекает. Если создать не вышло (нет права, флуд-лимит) — обычная ссылка на канал."""
+        if channel.can_invite is False:
+            await self._link_problem(channel)
+        elif self._link_pause.get(channel.tg_id) is _MISSING:
+            try:
+                link = await self.app.bot.create_chat_invite_link(
+                    channel.tg_id,
+                    name=invite_name(user.full_name, user.id),
+                    expire_date=int(self.wall()) + LINK_LIFETIME,
+                    member_limit=1,
+                )
+            except TelegramRetryAfter as error:  # много новых людей сразу — ненадолго обходимся обычной ссылкой
+                logger.info("Личные ссылки на «%s» — пауза %s с (лимит Telegram)", channel.title, error.retry_after)
+                self._link_pause.set(channel.tg_id, True, error.retry_after)
+            except (TelegramBadRequest, TelegramForbiddenError) as error:
+                logger.info("Не удалось создать личную ссылку на «%s»: %s", channel.title, error.message)
+                self._link_pause.set(channel.tg_id, True, LINK_RETRY)
+                await self._link_problem(channel, error.message)
+            except TelegramAPIError as error:
+                logger.info("Не удалось создать личную ссылку на «%s»: %s", channel.title, error)
+            else:
+                return link.invite_link
+        return fallback_link(channel)
+
+    async def reserve_link(self, channel: Chat) -> str | None:
+        """Запасная ссылка для подсказки, когда личную создать не выходит. У публичного канала это t.me/ник,
+        закрытому создаём общую ссылку-приглашение один раз и храним в базе."""
+        existing = fallback_link(channel)
+        if existing:
+            return existing
         try:
             link = await self.app.bot.create_chat_invite_link(channel.tg_id, name="Подписка для чатов")
         except TelegramAPIError as error:
             logger.info("Не удалось создать ссылку на «%s»: %s", channel.title, error)
-            await self._problem(
-                (channel.tg_id, "link"), texts.no_invite_link_text(channel.title), keyboards.open_sub_settings()
-            )
             return None
         await self.app.repo.update_chat(channel.id, invite_link=link.invite_link)
         self._channels.pop(channel.id)
         return link.invite_link
+
+    async def _link_problem(self, channel: Chat, error: str | None = None) -> None:
+        await self._problem(
+            (channel.tg_id, "link"),
+            texts.no_invite_link_text(channel.title, fallback=fallback_link(channel) is not None, error=error),
+            keyboards.open_sub_settings(),
+        )
 
     async def _notice(self, info: ChatInfo, message: Message) -> None:
         user = message.from_user
@@ -370,18 +412,22 @@ class Moderator:
             return
         key = (info.tg_id, user.id)
         if self._notices.get(key) is not _MISSING:
-            return
-        self._notices.set(key, True, NOTICE_INTERVAL)
+            return  # подсказка уже висит
+        self._notices.set(key, 0, NOTICE_INTERVAL)  # 0 — подсказка ещё отправляется
         missing = await self.missing_channels(user.id, info.channels)
         if not missing:
+            self._notices.pop(key)
             return
-        buttons = [(channel.title, await self.channel_link(channel)) for channel in missing]
+        shown = missing[:MAX_NOTICE_CHANNELS]
+        links = await asyncio.gather(*(self.personal_link(channel, user) for channel in shown))
         name = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
         try:
             sent = await self.app.bot.send_message(
                 info.tg_id,
                 texts.sub_notice_text(name, [channel.title for channel in missing]),
-                reply_markup=keyboards.sub_notice(buttons, user.id),
+                reply_markup=keyboards.sub_notice(
+                    [(channel.title, link) for channel, link in zip(shown, links, strict=True)], user.id
+                ),
                 message_thread_id=message.message_thread_id if message.is_topic_message else None,
                 disable_notification=True,
                 link_preview_options=NO_PREVIEW,
@@ -389,10 +435,29 @@ class Moderator:
         except TelegramAPIError as error:
             logger.info("Не удалось показать подсказку о подписке в «%s»: %s", info.title, error)
             return
-        self._later(self._delete_quietly(info.tg_id, sent.message_id, self.notice_lifetime))
+        self._live.add((info.tg_id, sent.message_id))
+        if self._notices.get(key) == 0:
+            self._notices.set(key, sent.message_id, NOTICE_INTERVAL)
+            delay = self.notice_lifetime
+        else:
+            delay = 0  # пока отправляли, человек подписался и написал — подсказка уже не нужна
+        self._later(self._delete_quietly(info.tg_id, sent.message_id, delay))
+
+    def notice_done(self, tg_id: int, user_id: int) -> int | None:
+        """Человек подписался: забыть его подсказку — если снова отпишется, новая появится сразу.
+        Возвращает id подсказки, если она ещё висит."""
+        key = (tg_id, user_id)
+        notice = self._notices.get(key)
+        if notice is _MISSING:
+            return None
+        self._notices.pop(key)
+        if notice:
+            self._live.discard((tg_id, notice))
+        return notice or None
 
     async def _delete_quietly(self, tg_id: int, message_id: int, delay: float) -> None:
         await asyncio.sleep(delay)
+        self._live.discard((tg_id, message_id))
         with contextlib.suppress(TelegramAPIError):
             await self.app.bot.delete_message(tg_id, message_id)
 
@@ -402,9 +467,21 @@ class Moderator:
         task.add_done_callback(self._tasks.discard)
 
     async def close(self) -> None:
+        """Остановка бота. Висящие подсказки убираем сразу: после перезапуска их уже никто не удалит."""
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        live, self._live = self._live, set()
+        by_chat: dict[int, list[int]] = {}
+        for tg_id, message_id in sorted(live):
+            by_chat.setdefault(tg_id, []).append(message_id)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self._delete_notices(by_chat), timeout=CLOSE_TIMEOUT)
+
+    async def _delete_notices(self, by_chat: dict[int, list[int]]) -> None:
+        for tg_id, ids in by_chat.items():
+            with contextlib.suppress(TelegramAPIError):
+                await self.app.bot.delete_messages(tg_id, ids)
 
     # ------------------------------------------------------------------ удаление
 
@@ -459,6 +536,29 @@ class Moderator:
         await self._problem(
             (channel.tg_id, "sub"), texts.sub_check_failed_text(channel.title, reason), keyboards.open_sub_settings()
         )
+
+
+def fallback_link(channel: Chat) -> str | None:
+    """Обычная ссылка на канал, без запросов к Telegram: t.me/ник или сохранённая общая ссылка-приглашение."""
+    if channel.username:
+        return f"https://t.me/{channel.username}"
+    return channel.invite_link
+
+
+def invite_name(full_name: str, user_id: int) -> str:
+    """Название личной ссылки «Имя · id» — в списке ссылок канала видно, чья она и вступил ли человек.
+    Telegram разрешает до 32 символов (считаем в UTF-16: эмодзи — за два); укорачиваем имя, id — никогда."""
+    suffix = f" · {user_id}"
+    room = LINK_NAME_LIMIT - len(suffix)
+    name = ""
+    for char in " ".join(full_name.split()):
+        size = 2 if ord(char) > 0xFFFF else 1
+        if size > room:
+            break
+        name += char
+        room -= size
+    name = name.strip()
+    return name + suffix if name else str(user_id)
 
 
 def required_channels(chat: Chat, common: Sequence[int]) -> tuple[int, ...]:
