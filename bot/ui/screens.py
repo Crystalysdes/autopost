@@ -865,12 +865,14 @@ async def picker_view(app: App, data: dict[str, Any]) -> Screen | None:
     for chat in chats[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]:
         mark = "☑️" if chat.id in selected else "⬜"
         suffix = " 🔄" if chat.id in linked else ""
-        rows.append([btn(f"{mark} {t.cut(chat.title, 38)}{suffix}", PickAct(a="t", v=chat.id))])
-    rows.append(_pager(page, pages, lambda p: PickAct(a="pg", v=p)))
+        rows.append([btn(f"{mark} {t.cut(chat.title, 38)}{suffix}", PickAct(a="t", s=source.id, v=chat.id))])
+    rows.append(_pager(page, pages, lambda p: PickAct(a="pg", s=source.id, v=p)))
     if chats:
-        rows.append([btn("☑️ Выбрать все", PickAct(a="all")), btn("⬜ Снять все", PickAct(a="none"))])
-        rows.append([btn("🚀 Применить и запустить", PickAct(a="go", v=1), GREEN)])
-        rows.append([btn("💾 Применить на паузе", PickAct(a="go", v=0))])
+        rows.append(
+            [btn("☑️ Выбрать все", PickAct(a="all", s=source.id)), btn("⬜ Снять все", PickAct(a="none", s=source.id))]
+        )
+        rows.append([btn("🚀 Применить и запустить", PickAct(a="go", s=source.id, v=1), GREEN)])
+        rows.append([btn("💾 Применить на паузе", PickAct(a="go", s=source.id, v=0))])
     rows.append(back("camp", source.id, "✖️ Отмена"))
     return "\n".join(lines), markup(*rows)
 

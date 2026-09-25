@@ -294,8 +294,8 @@ async def test_draft_save_and_apply_via_picker(feed, app):
     draft = (await app.repo.list_drafts())[0]
     await feed(
         press(CampAct(a="apply", id=draft.id)),
-        press(PickAct(a="t", v=chat_b.id)),
-        press(PickAct(a="go", v=1)),
+        press(PickAct(a="t", s=draft.id, v=chat_b.id)),
+        press(PickAct(a="go", s=draft.id, v=1)),
     )
     created = await app.repo.list_campaigns(chat_b.id)
     assert len(created) == 1 and created[0].is_active and created[0].next_run_ts
@@ -308,6 +308,19 @@ async def test_draft_save_and_apply_via_picker(feed, app):
     await feed(press(CampAct(a="sync_ok", id=draft.id)))
     assert (await app.repo.get_campaign(created[0].id)).times == ["08:00", "20:00"]
     assert (await app.repo.get_campaign(campaign.id)).times == ["08:00", "20:00"]
+
+
+async def test_stale_picker_buttons_do_not_apply(feed, app, session):
+    chat = await add_chat(feed, app, -101050)
+    draft_a = await app.repo.create_campaign(None, "A")
+    draft_b = await app.repo.create_campaign(None, "B")
+    for draft in (draft_a, draft_b):
+        await app.repo.add_post(draft.id, kind="text", payload={"text": "x"})
+    await feed(press(CampAct(a="apply", id=draft_a.id)), press(PickAct(a="t", s=draft_a.id, v=chat.id)))
+    await feed(press(CampAct(a="apply", id=draft_b.id)))  # открыли выбор для другого черновика
+    await feed(press(PickAct(a="go", s=draft_a.id, v=0)))  # кнопка из старого окна
+    assert await app.repo.list_campaigns(chat.id) == []
+    assert "устарело" in session.calls(AnswerCallbackQuery)[-1].text
 
 
 async def test_apply_draft_from_chat_screen(feed, app):
@@ -372,7 +385,7 @@ def test_callback_data_fits_telegram_limit():
         SchedAct(a="clrstart", id=big, v=big, w=big),
         OptAct(a="clrthread", id=big),
         ApplyDraft(chat=big, draft=big),
-        PickAct(a="go", v=big),
+        PickAct(a="none", s=big, v=big),
         SetAct(a="backup", v=big),
     ]
     for sample in samples:

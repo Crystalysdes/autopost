@@ -50,7 +50,11 @@ class ApplyDraft(CallbackData, prefix="a"):
 
 
 class PickAct(CallbackData, prefix="x"):
+    """Выбор чатов с галочками. s — id источника: кнопки старого окна выбора не должны
+    срабатывать для нового."""
+
     a: str
+    s: int
     v: int = 0
 
 

@@ -36,9 +36,9 @@ async def on_pick(
     callback_answer: CallbackAnswer,
 ) -> None:
     data = await state.get_data()
-    if not data.get("src"):
-        await state.clear()
-        callback_answer.text = "Выбор устарел — откройте его заново"
+    if not data.get("src") or int(data["src"]) != callback_data.s:
+        callback_answer.text = "Это окно выбора устарело — откройте его заново"
+        callback_answer.show_alert = True
         return
     selected = {int(x) for x in data.get("sel", [])}
     action = callback_data.a
