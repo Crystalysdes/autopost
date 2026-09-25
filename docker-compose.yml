@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: autopost-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # База всегда в томе, независимо от DB_PATH в .env
+      DB_PATH: /app/data/autopost.db
+    volumes:
+      - autopost-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  autopost-data:

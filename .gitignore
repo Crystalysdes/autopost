@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Секреты и данные бота
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,201 @@
+"""Форматирование и тексты интерфейса (HTML)."""
+
+from __future__ import annotations
+
+import html
+from collections.abc import Sequence
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+CHAT_TYPES = {"channel": "канал", "supergroup": "супергруппа", "group": "группа"}
+CHAT_ICONS = {"channel": "📢", "supergroup": "👥", "group": "👥"}
+
+
+def esc(value: object, limit: int | None = None) -> str:
+    """Обрезка ДО экранирования, чтобы не разрезать HTML-сущность."""
+    text = "" if value is None else str(value)
+    if limit and len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return html.escape(text)
+
+
+def cut(value: str, limit: int) -> str:
+    value = " ".join(value.split())
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def plural(number: int, one: str, few: str, many: str) -> str:
+    n = abs(number) % 100
+    n1 = n % 10
+    if 10 < n < 20:
+        return many
+    if n1 == 1:
+        return one
+    if 2 <= n1 <= 4:
+        return few
+    return many
+
+
+def utc_offset(tz: ZoneInfo, ts: int) -> str:
+    offset = datetime.fromtimestamp(ts, tz).utcoffset() or timedelta()
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "−"
+    hours, rest = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours}" + (f":{rest:02d}" if rest else "")
+
+
+def tz_label(name: str, tz: ZoneInfo, ts: int) -> str:
+    return f"{name} ({utc_offset(tz, ts)})"
+
+
+def fmt_ts(ts: int, tz: ZoneInfo, now_ts: int) -> str:
+    moment = datetime.fromtimestamp(ts, tz)
+    today = datetime.fromtimestamp(now_ts, tz).date()
+    day = moment.date()
+    if day == today:
+        prefix = "сегодня"
+    elif day == today + timedelta(days=1):
+        prefix = "завтра"
+    elif day == today - timedelta(days=1):
+        prefix = "вчера"
+    else:
+        prefix = f"{WEEKDAYS_SHORT[day.weekday()].lower()} {day:%d.%m}"
+    return f"{prefix} {moment:%H:%M}"
+
+
+def fmt_date(iso: str | None) -> str:
+    return date.fromisoformat(iso).strftime("%d.%m.%Y") if iso else "—"
+
+
+def day_start_ts(tz: ZoneInfo, now_ts: int) -> int:
+    today = datetime.fromtimestamp(now_ts, tz).date()
+    return int(datetime(today.year, today.month, today.day, tzinfo=tz).timestamp())
+
+
+def weekdays_label(weekdays: Sequence[int]) -> str:
+    days = sorted(set(weekdays))
+    if days == list(range(7)):
+        return "каждый день"
+    if days == [0, 1, 2, 3, 4]:
+        return "по будням"
+    if days == [5, 6]:
+        return "по выходным"
+    if not days:
+        return "дни не выбраны"
+    return ", ".join(WEEKDAYS_SHORT[d] for d in days)
+
+
+def times_label(times: Sequence[str]) -> str:
+    if not times:
+        return "не задано"
+    count = len(times)
+    shown = list(times) if count <= 12 else [*times[:10], "…"]
+    return f"{', '.join(shown)} ({count} {plural(count, 'раз', 'раза', 'раз')} в день)"
+
+
+def times_short(times: Sequence[str]) -> str:
+    if not times:
+        return "без расписания"
+    return f"{len(times)}/день"
+
+
+def period_label(start: str | None, end: str | None) -> str:
+    if start and end:
+        return f"с {fmt_date(start)} по {fmt_date(end)}"
+    if start:
+        return f"с {fmt_date(start)}"
+    if end:
+        return f"по {fmt_date(end)}"
+    return "без ограничений"
+
+
+def options_label(silent: bool, protect: bool, pin: bool, delete_prev: bool, thread_id: int | None) -> str:
+    parts = []
+    if silent:
+        parts.append("🔕 без звука")
+    if protect:
+        parts.append("🔒 защита")
+    if pin:
+        parts.append("📌 закреплять")
+    if delete_prev:
+        parts.append("🗑 удалять прошлый")
+    if thread_id:
+        parts.append(f"🧵 тема #{thread_id}")
+    return " · ".join(parts) if parts else "стандартные"
+
+
+def chat_kind(chat_type: str) -> str:
+    return CHAT_TYPES.get(chat_type, chat_type)
+
+
+# --------------------------------------------------------------------------- уведомления
+
+
+def chat_added_text(title: str, chat_type: str, can_post: bool, can_pin: bool) -> str:
+    lines = [f"✅ Бот добавлен в {chat_kind(chat_type)} «<b>{esc(title)}</b>».", ""]
+    if not can_post:
+        lines.append("⚠️ У бота нет права публиковать сообщения — выдайте его в настройках администраторов.")
+    elif not can_pin:
+        lines.append("Всё готово к публикациям. Чтобы закреплять посты, дайте боту право закрепления.")
+    else:
+        lines.append("Всё готово: создайте рассылку или примените черновик.")
+    return "\n".join(lines)
+
+
+def chat_pending_text(title: str, chat_type: str, actor_name: str, actor_id: int) -> str:
+    return (
+        f"⚠️ Бота добавил в {chat_kind(chat_type)} «<b>{esc(title)}</b>» другой человек: "
+        f'<a href="tg://user?id={actor_id}">{esc(actor_name)}</a> (<code>{actor_id}</code>).\n\n'
+        "Принять чат, чтобы публиковать в нём, или выйти из него?"
+    )
+
+
+def chat_back_text(title: str) -> str:
+    return (
+        f"✅ Бот снова в «<b>{esc(title)}</b>».\n"
+        "Рассылки этого чата стоят на паузе — запустите их, когда будете готовы."
+    )
+
+
+def chat_lost_text(title: str, reason: str) -> str:
+    return (
+        f"🚫 Бот потерял доступ к «<b>{esc(title)}</b>»: {esc(reason)}.\n\n"
+        "Рассылки этого чата поставлены на паузу. Верните бота администратором — "
+        "чат снова станет активным, а все настройки сохранятся."
+    )
+
+
+def lost_post_right_text(title: str) -> str:
+    return (
+        f"⚠️ В «<b>{esc(title)}</b>» у бота забрали право публиковать сообщения. "
+        "Пока его не вернут, посты туда отправляться не будут."
+    )
+
+
+def send_failed_text(name: str, chat_title: str, error: str) -> str:
+    return (
+        f"⚠️ Не удалось опубликовать пост рассылки «<b>{esc(name)}</b>» в «{esc(chat_title)}».\n"
+        f"Причина: <i>{esc(error, 400)}</i>\n\n"
+        "Бот попробует снова в следующий раз по расписанию."
+    )
+
+
+def auto_paused_text(name: str, chat_title: str, fails: int, error: str) -> str:
+    return (
+        f"⏸ Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» остановлена: "
+        f"{fails} {plural(fails, 'ошибка', 'ошибки', 'ошибок')} подряд.\n"
+        f"Последняя: <i>{esc(error, 400)}</i>\n\n"
+        "Исправьте причину и запустите рассылку снова."
+    )
+
+
+def finished_text(name: str, chat_title: str) -> str:
+    return f"🏁 Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» завершена: период публикаций закончился."
+
+
+def no_posts_text(name: str, chat_title: str) -> str:
+    return (
+        f"⚠️ Рассылка «<b>{esc(name)}</b>» в «{esc(chat_title)}» остановлена: в ней не осталось постов. "
+        "Добавьте посты и запустите её снова."
+    )
