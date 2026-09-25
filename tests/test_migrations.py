@@ -122,6 +122,20 @@ async def test_v1_database_is_migrated(tmp_path):
         await db.close()
 
 
+async def test_unfinished_backup_is_not_trusted(tmp_path):
+    path = tmp_path / "autopost.db"
+    await make_v1_database(path)
+    (tmp_path / "autopost-before-v2.db.part").write_bytes(b"oops")  # запись копии оборвалась в прошлый раз
+    db = Database(path)
+    await db.init()
+    await db.close()
+    backup = tmp_path / "autopost-before-v2.db"
+    with sqlite3.connect(backup) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("SELECT COUNT(*) FROM campaigns WHERE chat_id IS NOT NULL").fetchone() == (2,)
+    assert not (tmp_path / "autopost-before-v2.db.part").exists()
+
+
 async def test_fresh_database_starts_at_latest_version(tmp_path):
     db = Database(tmp_path / "fresh.db")
     await db.init()

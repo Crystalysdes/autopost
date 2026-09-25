@@ -65,7 +65,11 @@ async def run_migrations(db: Any) -> None:
     if version < 2:
         backup = db.path.with_name(f"{db.path.stem}-before-v2.db")
         if not backup.exists():
-            await db.backup_to(backup)
+            # Готовая копия появляется под своим именем только целиком: если запись оборвётся,
+            # при следующем запуске копия будет сделана заново, а не принята недописанной
+            partial = backup.with_name(backup.name + ".part")
+            await db.backup_to(partial)
+            partial.replace(backup)
             logger.info("Перед обновлением базы сохранена копия: %s", backup)
         async with db.engine.begin() as conn:
             for statement in _MIGRATE_V2:

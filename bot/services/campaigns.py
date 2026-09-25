@@ -41,10 +41,11 @@ def target_problem(target: Target) -> str | None:
     return None
 
 
-def targets_problems(targets: Sequence[Target]) -> list[str]:
+def targets_problems(targets: Sequence[Target], *, on_start: bool = False) -> list[str]:
+    """on_start — проверка перед запуском: паузу после ошибок запуск снимает, её не считаем помехой."""
     if not targets:
         return ["Отметьте чаты, в которые публиковать, — кнопка «💬 Чаты»"]
-    if not any(target.deliverable for target in targets):
+    if not any(t.chat.status == "active" and t.chat.can_post and (on_start or not t.link.paused) for t in targets):
         return ["Ни в одном из отмеченных чатов бот сейчас не может публиковать — откройте «💬 Чаты»"]
     return []
 
@@ -52,4 +53,5 @@ def targets_problems(targets: Sequence[Target]) -> list[str]:
 def readiness_problems(
     campaign: Campaign, posts: Sequence[Post], targets: Sequence[Target], tz: ZoneInfo, now: int
 ) -> list[str]:
-    return targets_problems(targets) + schedule_problems(campaign, posts, tz, now)
+    """Что мешает запустить рассылку (запуск снимает паузу после ошибок во всех её чатах)."""
+    return targets_problems(targets, on_start=True) + schedule_problems(campaign, posts, tz, now)

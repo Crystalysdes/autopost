@@ -28,7 +28,8 @@ async def on_my_chat_member(event: ChatMemberUpdated, app: App) -> None:
 
     if change.prev_status in (None, "left", "pending") and change.status == "active":
         if change.prev_status == "left":
-            await app.notify(texts.chat_back_text(chat.title), keyboards.open_chat(chat.id))
+            stopped = sum(1 for c in await app.repo.list_campaigns(chat.id) if not c.is_active)
+            await app.notify(texts.chat_back_text(chat.title, stopped), keyboards.chat_back(chat.id, stopped))
         else:
             await app.notify(
                 texts.chat_added_text(chat.title, chat.type, chat.can_post, chat.can_pin),

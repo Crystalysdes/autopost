@@ -187,7 +187,9 @@ async def test_draft_apply_makes_one_campaign_with_union_of_chats(repo: Repo):
     await repo.add_post(draft.id, kind="text", payload={"text": "1"}, buttons=[[{"text": "a", "url": "https://a.ru"}]])
     assert draft.is_draft and [d.id for d in await repo.list_drafts()] == [draft.id]
 
-    campaign, created = await repo.apply_draft(draft.id, [chat_a.id, chat_b.id], activate=False)
+    applied = await repo.apply_draft(draft.id, [chat_a.id, chat_b.id], activate=False)
+    campaign, created = applied.campaign, applied.created
+    assert applied.touched == [campaign.id]
     assert created and not campaign.is_draft and not campaign.is_active and campaign.source_draft_id == draft.id
     assert campaign.times == ["09:00"] and campaign.pin is True
     assert [p.buttons for p in await repo.list_posts(campaign.id)] == [[[{"text": "a", "url": "https://a.ru"}]]]
@@ -195,14 +197,57 @@ async def test_draft_apply_makes_one_campaign_with_union_of_chats(repo: Repo):
     # Правим черновик и применяем к другому чату — та же рассылка, чаты добавляются
     await repo.update_campaign(draft.id, times=["10:00", "20:00"])
     await repo.add_post(draft.id, kind="text", payload={"text": "2"})
-    again, created = await repo.apply_draft(draft.id, [chat_b.id, chat_c.id], activate=True)
-    assert not created and again.id == campaign.id and again.is_active
+    again = await repo.apply_draft(draft.id, [chat_b.id, chat_c.id], activate=True)
+    assert not again.created and again.campaign.id == campaign.id and again.campaign.is_active
     assert {t.chat.id for t in await repo.campaign_targets(campaign.id)} == {chat_a.id, chat_b.id, chat_c.id}
     updated = await repo.get_campaign(campaign.id)
     assert updated.times == ["10:00", "20:00"] and len(await repo.list_posts(campaign.id)) == 2
     assert await repo.count_campaigns() == 1
     assert await repo.linked_counts() == {draft.id: 3}
     assert await repo.apply_draft(campaign.id, [chat_a.id], activate=False) is None  # это не черновик
+
+
+async def test_reapplying_legacy_draft_does_not_duplicate_chat(repo: Repo):
+    """До v2 черновик, применённый к двум чатам, давал две рассылки. Повторное применение к этим чатам
+    не должно добавлять чат во вторую рассылку — иначе в него шло бы по два поста."""
+    chat_a = (await add_chat(repo, -1, title="A")).chat
+    chat_b = (await add_chat(repo, -2, title="B")).chat
+    chat_c = (await add_chat(repo, -3, title="C")).chat
+    draft = await repo.create_campaign("Шаблон", kind=DRAFT)
+    await repo.update_campaign(draft.id, times=["12:00"])
+    first = await repo.create_campaign("Шаблон", chat_ids=[chat_a.id])
+    second = await repo.create_campaign("Шаблон", chat_ids=[chat_b.id])
+    for campaign in (first, second):
+        await repo.update_campaign(campaign.id, source_draft_id=draft.id)
+
+    applied = await repo.apply_draft(draft.id, [chat_a.id, chat_b.id, chat_c.id], activate=False)
+    assert not applied.created and applied.campaign.id == first.id
+    assert sorted(applied.touched) == [first.id, second.id]
+    assert {t.chat.id for t in await repo.campaign_targets(first.id)} == {chat_a.id, chat_c.id}
+    assert [t.chat.id for t in await repo.campaign_targets(second.id)] == [chat_b.id]  # без второй рассылки
+    assert (await repo.get_campaign(second.id)).times == ["12:00"]  # но содержимое обновлено
+
+    only_b = await repo.apply_draft(draft.id, [chat_b.id], activate=True)
+    assert only_b.campaign.id == second.id and only_b.touched == [second.id]
+    assert (await repo.get_campaign(second.id)).is_active and not (await repo.get_campaign(first.id)).is_active
+
+
+async def test_start_resets_chat_pauses(repo: Repo):
+    chat = (await add_chat(repo, -1)).chat
+    campaign = await repo.create_campaign("R", chat_ids=[chat.id])
+    await repo.update_target(campaign.id, chat.id, paused=True, fail_count=5, last_error="boom")
+    await repo.reset_targets(campaign.id)
+    link = (await repo.campaign_targets(campaign.id))[0].link
+    assert not link.paused and link.fail_count == 0 and link.last_error is None
+
+
+async def test_results_for_deleted_chat_are_logged_without_it(repo: Repo):
+    chat = (await add_chat(repo, -1)).chat
+    campaign = await repo.create_campaign("R", chat_ids=[chat.id])
+    await repo.delete_chat(chat.id)  # удалили, пока шла отправка
+    await repo.record_target_sent(campaign.id, chat.id, None, [1], manual=False, now=1)
+    await repo.record_target_failed(campaign.id, chat.id, None, "x", manual=False, now=1, max_fails=5)
+    assert await repo.log_counts_since(0) == {"sent": 1, "failed": 1}
 
 
 async def test_save_as_draft_links_source_and_sync_keeps_chats(repo: Repo):
@@ -218,8 +263,9 @@ async def test_save_as_draft_links_source_and_sync_keeps_chats(repo: Repo):
     assert await repo.campaign_targets(draft.id) == []
 
     # Применение черновика добавляет чаты в ту же (исходную) рассылку, а не создаёт копию
-    campaign, created = await repo.apply_draft(draft.id, [chat_b.id], activate=False)
-    assert not created and campaign.id == source.id and campaign.is_active  # статус не сброшен
+    applied = await repo.apply_draft(draft.id, [chat_b.id], activate=False)
+    campaign = applied.campaign
+    assert not applied.created and campaign.id == source.id and campaign.is_active  # статус не сброшен
     assert {t.chat.id for t in await repo.campaign_targets(source.id)} == {chat_a.id, chat_b.id}
 
     await repo.update_campaign(draft.id, times=["08:00"])

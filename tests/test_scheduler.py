@@ -254,7 +254,38 @@ async def test_failure_in_one_chat_does_not_stop_others(app, scheduler, clock, s
     assert failed.fail_count == 1 and "нет прав" in failed.last_error and not failed.paused
     assert (await link_of(app, campaign.id, chats[0].id)).fail_count == 0
     messages = owner_messages(session)
-    assert len(messages) == 1 and "Не удалось опубликовать" in messages[0] and "В остальных чатах" in messages[0]
+    assert len(messages) == 1 and "Не удалось опубликовать" in messages[0] and "Опубликовано в 2 из 3" in messages[0]
+
+
+async def test_chat_deleted_mid_run_does_not_stop_others(app, scheduler, clock, session, monkeypatch):
+    campaign, chats = await make_campaign(app, chats=CHATS)
+    deleted = []
+
+    async def delete_second_chat(_seconds: float) -> None:
+        if not deleted:  # пауза перед вторым чатом — удаляем его из бота «посреди» отправки
+            deleted.append(True)
+            await app.repo.delete_chat(chats[1].id)
+
+    monkeypatch.setattr(scheduler_module.asyncio, "sleep", delete_second_chat)
+    clock.value = at(9) + 1
+    await run_tick(scheduler)
+    assert all(len(sent_to_chat(session, tg)) == 1 for tg in CHATS)
+    assert (await link_of(app, campaign.id, chats[2].id)).sent_count == 1
+
+
+async def test_unexpected_error_in_one_chat_does_not_stop_others(app, scheduler, clock, session, monkeypatch):
+    await make_campaign(app, chats=CHATS)
+    original = scheduler._deliver
+
+    async def broken_first(campaign, target, post, *, manual):
+        if target.chat.tg_id == CHATS[0]:
+            raise RuntimeError("boom")
+        return await original(campaign, target, post, manual=manual)
+
+    monkeypatch.setattr(scheduler, "_deliver", broken_first)
+    clock.value = at(9) + 1
+    await run_tick(scheduler)
+    assert [len(sent_to_chat(session, tg)) for tg in CHATS] == [0, 1, 1]
 
 
 async def test_auto_pause_only_for_failing_chat(app, scheduler, clock, session):

@@ -50,6 +50,7 @@ async def start_campaign(
         callback_answer.show_alert = True
         return
     await app.repo.update_campaign(campaign.id, is_active=True, last_error=None)
+    await app.repo.reset_targets(campaign.id)
     if app.scheduler:
         await app.scheduler.reschedule([campaign.id])
     fresh = await app.repo.get_campaign(campaign.id)

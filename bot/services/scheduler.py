@@ -265,7 +265,11 @@ class Scheduler:
         for index, target in enumerate(targets):
             if index:
                 await asyncio.sleep(TARGET_GAP)
-            outcomes.append(await self._deliver(campaign, target, post, manual=manual))
+            try:
+                outcomes.append(await self._deliver(campaign, target, post, manual=manual))
+            except Exception as error:  # сбой с одним чатом не должен сорвать отправку в остальные
+                logger.exception("Ошибка публикации рассылки %s в чат %s", campaign.id, target.chat.tg_id)
+                outcomes.append(Outcome(chat=target.chat, ok=False, error=f"Непредвиденная ошибка: {error}"))
         return outcomes
 
     async def _send(self, tg_id: int, post: PostData, campaign: Campaign, thread_id: int | None) -> SendResult:
@@ -377,8 +381,9 @@ class Scheduler:
             )
         fresh = [(o.chat.title, o.error or "") for o in outcomes if not o.ok and not o.lost and o.fails == 1]
         if fresh and self.app.settings.notify_errors:
+            sent = sum(1 for o in outcomes if o.ok)
             await self.app.notify(
-                texts.send_failed_text(campaign.name, fresh, len(outcomes)), keyboards.open_campaign(campaign.id)
+                texts.send_failed_text(campaign.name, fresh, sent, len(outcomes)), keyboards.open_campaign(campaign.id)
             )
 
 

@@ -70,6 +70,15 @@ class Target:
 
 
 @dataclass
+class DraftApplied:
+    """Итог применения черновика (см. Repo.apply_draft)."""
+
+    campaign: Campaign  # что показать: новая или основная рассылка, либо та, где уже был выбранный чат
+    created: bool
+    touched: list[int]  # рассылки, получившие содержимое черновика — их нужно перепланировать
+
+
+@dataclass
 class ClaimDecision:
     """Что планировщик решил сделать со слотом (см. Repo.claim_run)."""
 
@@ -471,6 +480,19 @@ class Repo:
         """Снимает паузу, поставленную после серии ошибок."""
         return await self.update_target(campaign_id, chat_id, paused=False, fail_count=0, last_error=None)
 
+    async def _reset_targets(self, s: AsyncSession, campaign_id: int) -> None:
+        await s.execute(
+            update(CampaignChat)
+            .where(CampaignChat.campaign_id == campaign_id)
+            .values(paused=False, fail_count=0, last_error=None)
+        )
+
+    async def reset_targets(self, campaign_id: int) -> None:
+        """Запуск рассылки — с чистого листа: пауза после ошибок снимается, счётчики ошибок обнуляются."""
+        async with self.db.session() as s:
+            await self._reset_targets(s, campaign_id)
+            await s.commit()
+
     async def resume_chat_targets(self, chat_id: int) -> int:
         """Снимает паузу после ошибок во всех рассылках этого чата."""
         async with self.db.session() as s:
@@ -513,39 +535,69 @@ class Repo:
             await s.commit()
             return draft
 
-    async def apply_draft(
-        self, draft_id: int, chat_ids: Iterable[int], *, activate: bool
-    ) -> tuple[Campaign, bool] | None:
+    async def apply_draft(self, draft_id: int, chat_ids: Iterable[int], *, activate: bool) -> DraftApplied | None:
         """Черновик → связанная с ним рассылка. При первом применении она создаётся, при повторном —
-        получает посты, расписание и опции черновика. Отмеченные чаты добавляются к уже выбранным.
+        получает посты, расписание и опции черновика, а новые отмеченные чаты добавляются к ней.
 
-        activate=True запускает рассылку; иначе новая создаётся остановленной, а у существующей
-        статус не меняется. Возвращает (рассылка, создана ли новая); None — черновика нет.
+        До версии 2 черновик, применённый к нескольким чатам, давал по рассылке на чат. Чат, который уже
+        есть в любой из них, второй раз не добавляется (иначе посты шли бы в него дважды) — его рассылка
+        просто получает содержимое черновика.
+
+        activate=True запускает затронутые рассылки; иначе новая создаётся остановленной,
+        а у существующих статус не меняется. None — черновика нет.
         """
+        chat_ids = list(dict.fromkeys(chat_ids))
         async with self.db.session() as s:
             draft = await s.get(Campaign, draft_id)
             if draft is None or draft.kind != DRAFT:
                 return None
             posts = await self._posts_of(s, draft.id)
-            dst = await s.scalar(
-                select(Campaign)
-                .where(Campaign.source_draft_id == draft.id, Campaign.kind == CAMPAIGN)
-                .order_by(Campaign.id)
-                .limit(1)
+            linked = list(
+                (
+                    await s.scalars(
+                        select(Campaign)
+                        .where(Campaign.source_draft_id == draft.id, Campaign.kind == CAMPAIGN)
+                        .order_by(Campaign.id)
+                    )
+                ).all()
             )
-            created = dst is None
-            if dst is None:
-                dst = _blank(draft.name, CAMPAIGN)
-                dst.source_draft_id = draft.id
-                s.add(dst)
+            by_id = {c.id: c for c in linked}
+            owner: dict[int, Campaign] = {}  # чат -> рассылка из этого черновика, где он уже отмечен
+            if linked:
+                rows = await s.execute(
+                    select(CampaignChat.chat_id, CampaignChat.campaign_id)
+                    .where(CampaignChat.campaign_id.in_(list(by_id)))
+                    .order_by(CampaignChat.campaign_id)
+                )
+                for chat_id, campaign_id in rows.all():
+                    owner.setdefault(chat_id, by_id[campaign_id])
+            created = not linked
+            if created:
+                primary = _blank(draft.name, CAMPAIGN)
+                primary.source_draft_id = draft.id
+                s.add(primary)
                 await s.flush()
-            await self._copy_template(s, draft, dst, posts)
-            await self._add_targets(s, dst.id, chat_ids)
+            else:
+                primary = linked[0]
+            new_chats = [chat_id for chat_id in chat_ids if chat_id not in owner]
+            touched: dict[int, Campaign] = {}
+            if created or new_chats:
+                touched[primary.id] = primary
+            for chat_id in chat_ids:
+                if chat_id in owner:
+                    touched.setdefault(owner[chat_id].id, owner[chat_id])
+            for campaign in touched.values():
+                await self._copy_template(s, draft, campaign, posts)
+            await self._add_targets(s, primary.id, new_chats)
             if activate:
-                dst.is_active = True
-                dst.last_error = None
+                for campaign in touched.values():
+                    if not campaign.is_active:
+                        await self._reset_targets(s, campaign.id)
+                    campaign.is_active = True
+                    campaign.last_error = None
             await s.commit()
-            return dst, created
+            shown = owner[chat_ids[0]] if len(chat_ids) == 1 and chat_ids[0] in owner else primary
+            return DraftApplied(campaign=shown, created=created, touched=list(touched))
 
     async def sync_draft(self, draft_id: int) -> list[Campaign]:
         """«Обновить рассылки»: посты, расписание и опции черновика переносятся во все связанные
@@ -786,6 +838,10 @@ class Repo:
             select(CampaignChat).where(CampaignChat.campaign_id == campaign_id, CampaignChat.chat_id == chat_id)
         )
 
+    async def _log_chat(self, s: AsyncSession, chat_id: int) -> int | None:
+        # Чат могли удалить из бота прямо во время отправки — запись в журнал без него
+        return chat_id if await s.get(Chat, chat_id) is not None else None
+
     async def record_target_sent(
         self,
         campaign_id: int,
@@ -799,6 +855,7 @@ class Repo:
     ) -> None:
         async with self.db.session() as s:
             link = await self._link(s, campaign_id, chat_id)
+            log_chat = await self._log_chat(s, chat_id)
             if link is not None:  # чат могли снять с рассылки, пока шла отправка
                 link.last_message_ids = list(message_ids)
                 link.last_sent_ts = now
@@ -808,7 +865,7 @@ class Repo:
             s.add(
                 SendLog(
                     campaign_id=campaign_id,
-                    chat_id=chat_id,
+                    chat_id=log_chat,
                     post_id=post_id,
                     status="sent",
                     manual=manual,
@@ -834,6 +891,7 @@ class Repo:
         max_fails=None — не ставить на паузу (например, бота удалили из чата)."""
         async with self.db.session() as s:
             link = await self._link(s, campaign_id, chat_id)
+            log_chat = await self._log_chat(s, chat_id)
             fails, paused = 0, False
             if link is not None:
                 fails = (link.fail_count or 0) + 1
@@ -844,7 +902,7 @@ class Repo:
             s.add(
                 SendLog(
                     campaign_id=campaign_id,
-                    chat_id=chat_id,
+                    chat_id=log_chat,
                     post_id=post_id,
                     status="failed",
                     manual=manual,

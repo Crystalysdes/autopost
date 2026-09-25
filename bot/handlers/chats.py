@@ -10,7 +10,9 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
+from bot.db.models import Chat
 from bot.services import chats as chat_service
+from bot.services.campaigns import readiness_problems
 from bot.ui import keyboards, screens
 from bot.ui.callbacks import ApplyDraft, ChatAct
 from bot.ui.render import show
@@ -165,33 +167,74 @@ async def apply_draft(
         callback_answer.text = "Черновик уже удалён"
         await show(app, callback, await screens.chat_view(app, chat.id))
         return
-    campaign, created = result
+    campaign = result.campaign
     if app.scheduler:
-        await app.scheduler.reschedule([campaign.id])
-    if created:
+        await app.scheduler.reschedule(result.touched)
+    if result.created:
         note = "✅ Из черновика создана рассылка с этим чатом. Проверьте её и нажмите «▶️ Запустить»."
     else:
         note = (
-            "🔄 Рассылка из этого черновика уже была — чат добавлен в неё, а посты, расписание и опции "
-            "обновлены по черновику."
+            "🔄 Рассылка из этого черновика уже была — чат в ней, а посты, расписание и опции обновлены по черновику."
         )
     app.remember_origin(callback.from_user.id, campaign.id, chat.id)
     screen = await screens.campaign_view(app, campaign.id, note=note, user_id=callback.from_user.id)
     await show(app, callback, screen or await screens.chat_view(app, chat.id))
 
 
-@router.callback_query(ChatAct.filter(F.a == "resume"))
-async def resume_chat(
+async def _usable_chat(
     callback: CallbackQuery, callback_data: ChatAct, app: App, callback_answer: CallbackAnswer
-) -> None:
-    """Снимает паузу после ошибок со всех рассылок этого чата."""
+) -> Chat | None:
     chat = await app.repo.get_chat(callback_data.id)
     if chat is None:
-        return await _gone(callback, app, callback_answer)
+        await _gone(callback, app, callback_answer)
+        return None
     if chat.status != "active" or not chat.can_post:
         callback_answer.text = "Бот не может публиковать в этом чате — сначала верните ему права"
         callback_answer.show_alert = True
+        return None
+    return chat
+
+
+@router.callback_query(ChatAct.filter(F.a == "unpause"))
+async def unpause_chat(
+    callback: CallbackQuery, callback_data: ChatAct, app: App, callback_answer: CallbackAnswer
+) -> None:
+    """Снимает паузу после ошибок со всех рассылок этого чата."""
+    chat = await _usable_chat(callback, callback_data, app, callback_answer)
+    if chat is None:
         return
     resumed = await app.repo.resume_chat_targets(chat.id)
     callback_answer.text = f"▶️ Возобновлено в рассылках: {resumed}" if resumed else "Паузы уже нет"
+    await show(app, callback, await screens.chat_view(app, chat.id))
+
+
+@router.callback_query(ChatAct.filter(F.a == "resume"))
+async def start_stopped(
+    callback: CallbackQuery, callback_data: ChatAct, app: App, callback_answer: CallbackAnswer
+) -> None:
+    """Запускает остановленные рассылки с этим чатом (кнопка есть и в старых уведомлениях
+    «бот снова в чате») и снимает паузу после ошибок в этом чате."""
+    chat = await _usable_chat(callback, callback_data, app, callback_answer)
+    if chat is None:
+        return
+    now = app.scheduler.now() if app.scheduler else 0
+    started, not_ready = [], 0
+    for campaign in await app.repo.list_campaigns(chat.id):
+        if campaign.is_active:
+            continue
+        posts = await app.repo.list_posts(campaign.id)
+        targets = await app.repo.campaign_targets(campaign.id)
+        if readiness_problems(campaign, posts, targets, app.settings.tz, now):
+            not_ready += 1
+            continue
+        await app.repo.update_campaign(campaign.id, is_active=True, last_error=None)
+        await app.repo.reset_targets(campaign.id)
+        started.append(campaign.id)
+    await app.repo.resume_chat_targets(chat.id)
+    if app.scheduler and started:
+        await app.scheduler.reschedule(started)
+    text = f"▶️ Запущено рассылок: {len(started)}"
+    if not_ready:
+        text += f", не готовы к запуску (нет постов или времени): {not_ready}"
+    callback_answer.text = text
     await show(app, callback, await screens.chat_view(app, chat.id))

@@ -19,6 +19,7 @@ from bot.ui.render import prompt, show
 router = Router(name="library")
 
 NEW_POST_DONE_NOTE = "👉 Теперь отметьте чаты («💬 Чаты»), задайте время («⏰ Расписание») и нажмите «▶️ Запустить»."
+NO_POSTS_NOTE = "Постов пока нет — добавьте их в «📝 Посты». Если рассылка не нужна, удалите её кнопкой «🗑 Удалить»."
 NEW_FROM_POST_NOTE = (
     "✨ Создана рассылка «{name}» с этим постом. Отметьте чаты, в которые публиковать, "
     "затем задайте время в «⏰ Расписание» и нажмите «▶️ Запустить»."
@@ -44,17 +45,18 @@ async def new_post(callback: CallbackQuery, state: FSMContext, app: App) -> None
         state,
         Input.posts,
         ADD_POSTS_TEXT + f"\n\nПосты попадут в новую рассылку «{t.esc(campaign.name)}».",
-        cancel=LibAct(a="drop", id=campaign.id),
+        # created_ts в кнопке: старая «Отмена» не удалит другую рассылку, получившую тот же id
+        cancel=LibAct(a="drop", id=campaign.id, v=campaign.created_ts),
         extra=[[btn("✅ Готово", CampAct(a="fin", id=campaign.id), GREEN)]],
         camp_id=campaign.id,
         done="fin",
     )
 
 
-async def drop_if_empty(app: App, campaign_id: int) -> bool:
+async def drop_if_empty(app: App, campaign_id: int, created_ts: int) -> bool:
     """Рассылку, созданную под новый пост, убираем, если в неё так ничего и не добавили."""
     campaign = await app.repo.get_campaign(campaign_id)
-    if campaign is None or campaign.is_draft or campaign.is_active:
+    if campaign is None or campaign.created_ts != created_ts or campaign.is_draft or campaign.is_active:
         return False
     if await app.repo.list_posts(campaign.id) or await app.repo.campaign_targets(campaign.id):
         return False
@@ -64,7 +66,7 @@ async def drop_if_empty(app: App, campaign_id: int) -> bool:
 
 @router.callback_query(LibAct.filter(F.a == "drop"))
 async def cancel_new_post(callback: CallbackQuery, callback_data: LibAct, app: App) -> None:
-    if await drop_if_empty(app, callback_data.id):
+    if await drop_if_empty(app, callback_data.id, callback_data.v):
         await show(app, callback, await screens.library_view(app))
         return
     screen = await screens.campaign_view(app, callback_data.id, user_id=callback.from_user.id)
@@ -79,13 +81,14 @@ async def done_new_post(
     app: App,
     callback_answer: CallbackAnswer,
 ) -> None:
-    """«Готово» после «➕ Новый пост»: дальше — выбрать чаты и время."""
+    """«Готово» после «➕ Новый пост»: дальше — выбрать чаты и время. Рассылку здесь не удаляем, даже
+    если постов нет: альбом, присланный перед нажатием, ещё может собираться и сохранится через миг."""
     await state.clear()
-    if await drop_if_empty(app, callback_data.id):
-        callback_answer.text = "Пост не добавлен"
-        await show(app, callback, await screens.library_view(app))
-        return
-    screen = await screens.campaign_view(app, callback_data.id, note=NEW_POST_DONE_NOTE, user_id=callback.from_user.id)
+    posts = await app.repo.list_posts(callback_data.id)
+    note = NEW_POST_DONE_NOTE if posts else NO_POSTS_NOTE
+    screen = await screens.campaign_view(app, callback_data.id, note=note, user_id=callback.from_user.id)
+    if screen is None:
+        callback_answer.text = "Рассылка уже удалена"
     await show(app, callback, screen or await screens.library_view(app))
 
 

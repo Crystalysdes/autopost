@@ -504,8 +504,41 @@ async def test_resume_paused_chat(feed, app, session):
     assert target.deliverable and target.link.fail_count == 0
     # То же — с экрана чата, для всех его рассылок сразу
     await app.repo.update_target(campaign.id, chat.id, paused=True)
-    await feed(press(ChatAct(a="resume", id=chat.id)))
+    await feed(press(Nav(to="chat", id=chat.id)))
+    assert ChatAct(a="unpause", id=chat.id).pack() in button_data(last_markup(session))
+    await feed(press(ChatAct(a="unpause", id=chat.id)))
     assert (await app.repo.campaign_targets(campaign.id))[0].deliverable
+    assert not (await app.repo.get_campaign(campaign.id)).is_active  # запуск — отдельной кнопкой
+
+
+async def test_start_clears_chat_pause(feed, app, session):
+    chat = await add_chat(feed, app, -102351)
+    campaign = await app.repo.create_campaign("R", chat_ids=[chat.id])
+    await app.repo.add_post(campaign.id, kind="text", payload={"text": "x"})
+    await app.repo.update_campaign(campaign.id, times=["12:00"])
+    await app.repo.update_target(campaign.id, chat.id, paused=True, fail_count=5, last_error="boom")
+    await feed(press(CampAct(a="on", id=campaign.id)))
+    assert (await app.repo.get_campaign(campaign.id)).is_active
+    link = (await app.repo.campaign_targets(campaign.id))[0].link
+    assert not link.paused and link.fail_count == 0
+
+
+async def test_bot_back_offers_to_start_stopped_campaigns(feed, app, session):
+    chat = await add_chat(feed, app, -102361)
+    ready = await app.repo.create_campaign("Готовая", chat_ids=[chat.id])
+    await app.repo.add_post(ready.id, kind="text", payload={"text": "x"})
+    await app.repo.update_campaign(ready.id, times=["12:00"])
+    empty = await app.repo.create_campaign("Пустая", chat_ids=[chat.id])
+    await feed(membership(-102361, actor=STRANGER, new=left_member()))
+    await feed(membership(-102361))  # бота вернули
+    notice = [r for r in session.calls(SendMessage) if r.chat_id == OWNER_ID][-1]
+    assert "Остановлено рассылок с этим чатом: 2" in notice.text
+    start = ChatAct(a="resume", id=chat.id)
+    assert start.pack() in button_data(notice.reply_markup)
+    await feed(press(start))
+    assert (await app.repo.get_campaign(ready.id)).is_active
+    assert not (await app.repo.get_campaign(empty.id)).is_active  # без постов и времени не запускаем
+    assert "не готовы к запуску" in session.calls(AnswerCallbackQuery)[-1].text
 
 
 # ---------------------------------------------------------------------- мои посты
@@ -571,14 +604,26 @@ async def test_new_post_from_library(feed, dp, bot, app, session):
 async def test_cancel_new_post_removes_empty_campaign(feed, app, session):
     await feed(press(LibAct(a="add", id=0)))
     campaign = (await app.repo.list_campaigns())[0]
-    await feed(press(LibAct(a="drop", id=campaign.id)))
+    cancel = LibAct(a="drop", id=campaign.id, v=campaign.created_ts)
+    assert cancel.pack() in button_data(last_markup(session))
+    await feed(press(cancel))
     assert await app.repo.list_campaigns() == []
     assert "Мои посты" in owner_texts(session)[-1]
-    # «Готово» без единого поста — тоже без пустой рассылки
+
+
+async def test_stale_cancel_does_not_delete_other_campaign(feed, app):
+    campaign = await app.repo.create_campaign("Новая")  # мог получить id удалённой рассылки
+    await feed(press(LibAct(a="drop", id=campaign.id, v=campaign.created_ts - 100)))
+    assert [c.id for c in await app.repo.list_campaigns()] == [campaign.id]
+
+
+async def test_done_without_posts_keeps_campaign(feed, app, session):
+    """Альбом, присланный перед «Готово», может ещё собираться — рассылку не удаляем."""
     await feed(press(LibAct(a="add", id=0)))
     campaign = (await app.repo.list_campaigns())[0]
     await feed(press(CampAct(a="fin", id=campaign.id)))
-    assert await app.repo.list_campaigns() == []
+    assert [c.id for c in await app.repo.list_campaigns()] == [campaign.id]
+    assert "Постов пока нет" in owner_texts(session)[-1]
 
 
 async def test_delete_post_from_library_returns_to_library(feed, app, session):

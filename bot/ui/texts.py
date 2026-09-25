@@ -156,11 +156,18 @@ def chat_pending_text(title: str, chat_type: str, actor_name: str, actor_id: int
     )
 
 
-def chat_back_text(title: str) -> str:
-    return (
-        f"✅ Бот снова в «<b>{esc(title)}</b>».\n"
-        "Рассылки, в которых отмечен этот чат, снова публикуют в него по расписанию."
+def chat_back_text(title: str, stopped: int = 0) -> str:
+    """stopped — сколько рассылок с этим чатом остановлено (например, старая версия бота останавливала
+    их, когда бота удаляли из чата)."""
+    text = (
+        f"✅ Бот снова в «<b>{esc(title)}</b>».\nЗапущенные рассылки с этим чатом снова публикуют в него по расписанию."
     )
+    if stopped:
+        text += (
+            f"\n\nОстановлено рассылок с этим чатом: {stopped}. Запустите их, когда будете готовы "
+            "(кнопка ниже запустит все, где есть посты и время)."
+        )
+    return text
 
 
 def chat_lost_text(title: str, reason: str) -> str:
@@ -185,8 +192,8 @@ def _failure_lines(failures: Sequence[tuple[str, str]], limit: int = 10) -> str:
     return "\n".join(lines)
 
 
-def send_failed_text(name: str, failures: Sequence[tuple[str, str]], total: int) -> str:
-    """failures — [(название чата, причина)]; total — во сколько чатов публиковали."""
+def send_failed_text(name: str, failures: Sequence[tuple[str, str]], sent: int, total: int) -> str:
+    """failures — [(название чата, причина)]; sent из total — в скольких чатах пост вышел."""
     if len(failures) == 1:
         title, error = failures[0]
         head = (
@@ -198,8 +205,8 @@ def send_failed_text(name: str, failures: Sequence[tuple[str, str]], total: int)
             f"⚠️ Не удалось опубликовать пост рассылки «<b>{esc(name)}</b>» в {len(failures)} "
             f"{plural(len(failures), 'чат', 'чата', 'чатов')}:\n{_failure_lines(failures)}"
         )
-    if total > len(failures):
-        head += "\nВ остальных чатах пост опубликован."
+    if sent:
+        head += f"\nОпубликовано в {sent} из {total} {plural(total, 'чата', 'чатов', 'чатов')}."
     return head + "\n\nБот попробует снова в следующий раз по расписанию."
 
 

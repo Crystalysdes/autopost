@@ -107,7 +107,6 @@ async def _apply(
         callback_answer.text = "Черновик уже удалён"
         await show(app, callback, await screens.main_menu(app))
         return True
-    campaign, created = result
     warnings: list[str] = []
     no_post = [chats[chat_id].title for chat_id in selected if not chats[chat_id].can_post]
     if no_post:
@@ -116,6 +115,6 @@ async def _apply(
     if source.pin and no_pin:
         warnings.append(f"📌 Нет права закреплять: {t.names_label(no_pin, 10)}")
     if app.scheduler:
-        await app.scheduler.reschedule([campaign.id])
-    await show(app, callback, await screens.apply_summary(app, source.id, campaign.id, created, warnings))
+        await app.scheduler.reschedule(result.touched)
+    await show(app, callback, await screens.apply_summary(app, source.id, result, warnings))
     return True

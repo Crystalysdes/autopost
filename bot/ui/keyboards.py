@@ -69,6 +69,11 @@ def chat_pending(chat_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def chat_back(chat_id: int, stopped: int) -> InlineKeyboardMarkup:
+    start = [btn(f"▶️ Запустить остановленные ({stopped})", ChatAct(a="resume", id=chat_id), GREEN)]
+    return markup(start if stopped else None, [btn("⚙️ Открыть чат", Nav(to="chat", id=chat_id))])
+
+
 def campaign_problem(campaign_id: int) -> InlineKeyboardMarkup:
     return markup(
         [btn("💬 Чаты рассылки", Nav(to="tgt", id=campaign_id), BLUE)],

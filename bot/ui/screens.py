@@ -13,7 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.app import App
 from bot.db.models import Campaign, Post, now_ts
-from bot.db.repo import Target
+from bot.db.repo import DraftApplied, Target
 from bot.services import schedule_utils as su
 from bot.services.buttons import buttons_to_html, count_buttons, has_icons
 from bot.services.campaigns import target_problem
@@ -275,8 +275,11 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
             btn("📝 Из черновика", ChatAct(a="fromdraft", id=chat.id)),
         ]
     )
-    if paused_links:
-        rows.append([btn(f"▶️ Возобновить публикации сюда ({paused_links})", ChatAct(a="resume", id=chat.id), GREEN)])
+    if chat.status == "active" and paused_links:
+        rows.append([btn(f"▶️ Возобновить публикации сюда ({paused_links})", ChatAct(a="unpause", id=chat.id), GREEN)])
+    stopped = sum(1 for c in campaigns if not c.is_active)
+    if chat.status == "active" and stopped:
+        rows.append([btn(f"▶️ Запустить остановленные ({stopped})", ChatAct(a="resume", id=chat.id))])
     rows.append(
         [
             btn("🔄 Обновить права", ChatAct(a="refresh", id=chat.id)),
@@ -1155,10 +1158,16 @@ async def picker_view(app: App, data: dict[str, Any]) -> Screen | None:
 
     lines = [f"<b>📤 Применить черновик «{t.esc(source.name)}»</b>", ""]
     if chats:
-        if linked:
+        if len(linked) == 1:
             lines.append(
                 f"Из черновика уже есть рассылка «{t.esc(linked[0].name)}». Отмеченные чаты добавятся к ней, "
                 "а её посты, расписание и опции обновятся по черновику."
+            )
+        elif linked:
+            lines.append(
+                f"Из черновика уже есть рассылки ({len(linked)}). Новые чаты добавятся в первую из них, "
+                f"«{t.esc(linked[0].name)}». Для чатов с 🔄 второй рассылки не будет — их рассылка просто "
+                "обновится по черновику."
             )
         else:
             lines.append(
@@ -1187,26 +1196,40 @@ async def picker_view(app: App, data: dict[str, Any]) -> Screen | None:
     return "\n".join(lines), markup(*rows)
 
 
-async def apply_summary(app: App, draft_id: int, campaign_id: int, created: bool, warnings: list[str]) -> Screen:
-    campaign = await app.repo.get_campaign(campaign_id)
+async def apply_summary(app: App, draft_id: int, applied: DraftApplied, warnings: list[str]) -> Screen:
     tz, now = app.settings.tz, _now(app)
-    lines = ["<b>✅ Готово</b>", ""]
-    if campaign is not None:
-        targets = await app.repo.campaign_targets(campaign.id)
-        lines.append(("Создана рассылка" if created else "Обновлена рассылка") + f" «<b>{t.esc(campaign.name)}</b>».")
-        lines.append(f"💬 Чаты ({len(targets)}): {t.names_label([x.chat.title for x in targets], 10)}")
+    lines = ["<b>✅ Готово</b>"]
+    targets = await app.repo.targets_of(applied.touched)
+    campaigns = [c for c in [await app.repo.get_campaign(cid) for cid in applied.touched] if c is not None]
+    for campaign in campaigns[:10]:
+        created = applied.created and campaign.id == applied.campaign.id
+        names = [x.chat.title for x in targets.get(campaign.id, [])]
         if campaign.is_active and campaign.next_run_ts:
             status = f"🟢 работает, ближайшая {t.fmt_ts(campaign.next_run_ts, tz, now)}"
         elif campaign.is_active:
             status = "🟢 запущена"
         else:
             status = "⏸ остановлена — проверьте и нажмите «▶️ Запустить»"
-        lines.append(f"Статус: {status}")
+        lines += [
+            "",
+            ("Создана рассылка" if created else "Обновлена рассылка") + f" «<b>{t.esc(campaign.name)}</b>».",
+            f"💬 Чаты ({len(names)}): {t.names_label(names, 10) if names else 'не выбраны'}",
+            f"Статус: {status}",
+        ]
+    if len(campaigns) > 10:
+        lines.append(f"\n…и ещё рассылок: {len(campaigns) - 10}")
     if warnings:
         lines += ["", *(w if len(w) < 1500 else w[:1500] + "…" for w in warnings)]
-    rows = []
-    if campaign is not None:
-        rows.append([btn("📬 Открыть рассылку", Nav(to="camp", id=campaign.id, f=-1), BLUE)])
+    rows = [
+        [
+            btn(
+                f"📬 {t.cut(c.name, 30)} · {_chats_word(len(targets.get(c.id, [])))}",
+                Nav(to="camp", id=c.id, f=-1),
+                BLUE if i == 0 else None,
+            )
+        ]
+        for i, c in enumerate(campaigns[:5])
+    ]
     rows.append(back("camp", draft_id, "« К черновику"))
     return "\n".join(lines), markup(*rows)
 
