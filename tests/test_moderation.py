@@ -17,6 +17,7 @@ from aiogram.methods import (
     CreateChatInviteLink,
     DeleteMessage,
     DeleteMessages,
+    EditMessageReplyMarkup,
     GetChat,
     GetChatAdministrators,
     GetChatMember,
@@ -439,12 +440,54 @@ def test_invite_name_fits_telegram_limit():
     assert len(long.encode("utf-16-le")) // 2 <= 32
 
 
-async def test_other_member_pressing_does_not_remove_notice(feed, app, session, moderator):
+async def test_only_addressee_can_use_check_button(feed, app, session, moderator):
     await setup_subscription(feed, app, moderator)
-    session.handlers[GetChatMember] = member_handler({MEMBER.id})
+    session.handlers[GetChatMember] = member_handler({MEMBER.id})  # нажавший подписан, адресат — нет
+    session.clear()
     await feed(press_in_group(SubCheck(u=STRANGER_ID), MEMBER, message_id=5151))
-    assert "Спасибо" in session.calls(AnswerCallbackQuery)[-1].text
-    assert 5151 not in deleted(session)
+    answer = session.calls(AnswerCallbackQuery)[-1]
+    assert answer.show_alert and "для участника, к которому обращается подсказка" in answer.text
+    assert [c for c in session.calls(GetChatMember) if c.user_id == MEMBER.id] == []  # его подписку не проверяли
+    assert 5151 not in deleted(session)  # подсказка на месте
+
+    blocked = group_msg(text="А я всё равно пишу")  # адресат по-прежнему не может писать
+    await feed(blocked)
+    assert blocked.message.message_id in deleted(session)
+
+
+async def test_admin_sees_addressee_status(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator)
+    subscribed: set[int] = set()
+    session.handlers[GetChatMember] = member_handler(subscribed)
+    owner = User(id=OWNER_ID, is_bot=False, first_name="Владелец")
+    await feed(press_in_group(SubCheck(u=STRANGER_ID), owner, message_id=6161))
+    answer = session.calls(AnswerCallbackQuery)[-1]
+    assert answer.show_alert and "ещё не подписан" in answer.text and "писать не сможет" in answer.text
+    assert 6161 not in deleted(session)
+
+    subscribed.add(STRANGER_ID)
+    await feed(press_in_group(SubCheck(u=STRANGER_ID), owner, message_id=6161))
+    assert "уже подписан" in session.calls(AnswerCallbackQuery)[-1].text
+    assert 6161 in deleted(session)  # подсказка больше не нужна
+
+
+async def test_failed_check_refreshes_personal_links(feed, app, session, clock):
+    moderator = clocked(app, clock)
+    await setup_subscription(feed, app, moderator)
+    session.handlers[GetChatMember] = member_handler(set())
+    session.clear()
+    await feed(press_in_group(SubCheck(u=STRANGER_ID), STRANGER, message_id=7171))
+    (edit,) = session.calls(EditMessageReplyMarkup)
+    assert edit.message_id == 7171
+    links = [b.url for row in edit.reply_markup.inline_keyboard for b in row if b.url]
+    assert links and links[0].startswith(f"https://t.me/+invite{CHANNEL}_")  # новая личная ссылка
+    assert "Ссылки в подсказке обновлены" in session.calls(AnswerCallbackQuery)[-1].text
+
+    await feed(press_in_group(SubCheck(u=STRANGER_ID), STRANGER, message_id=7171))
+    assert len(session.calls(EditMessageReplyMarkup)) == 1  # не чаще раза в 30 секунд
+    clock.advance(31)
+    await feed(press_in_group(SubCheck(u=STRANGER_ID), STRANGER, message_id=7171))
+    assert len(session.calls(EditMessageReplyMarkup)) == 2
 
 
 async def test_subscription_modes(feed, app, session, moderator):

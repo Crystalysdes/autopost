@@ -59,6 +59,7 @@ SUB_NO_TTL = 15  # короткий: человек подписался — ч�
 ALBUM_TTL = 120
 NOTICE_LIFETIME = 5 * 60  # подсказка неподписанному удаляется сама
 NOTICE_INTERVAL = NOTICE_LIFETIME  # одна подсказка на человека: пока она висит, новые сообщения удаляются молча
+NOTICE_REFRESH = 30  # новые ссылки в подсказке по «Проверить подписку» — не чаще
 MAX_NOTICE_CHANNELS = 5  # кнопок-ссылок на каналы в подсказке
 LINK_LIFETIME = 3600  # личная ссылка-приглашение: с запасом, чтобы успеть нажать «Вступить»
 LINK_RETRY = 600  # после отказа Telegram снова пробуем создавать личные ссылки на канал не раньше
@@ -150,6 +151,7 @@ class Moderator:
         self._subs = TTLCache(clock)
         self._albums = TTLCache(clock)
         self._notices = TTLCache(clock)
+        self._refreshed = TTLCache(clock)  # подсказки, где ссылки недавно обновлены
         self._problems = TTLCache(clock)
         self._channels = TTLCache(clock)
         self._link_pause = TTLCache(clock)  # каналы, где личные ссылки сейчас не создаются
@@ -483,16 +485,12 @@ class Moderator:
         if not missing:
             self._notices.pop(key)
             return
-        shown = missing[:MAX_NOTICE_CHANNELS]
-        links = await asyncio.gather(*(self.personal_link(channel, user) for channel in shown))
         name = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
         try:
             sent = await self.app.bot.send_message(
                 info.tg_id,
                 texts.sub_notice_text(name, [channel.title for channel in missing]),
-                reply_markup=keyboards.sub_notice(
-                    [(channel.title, link) for channel, link in zip(shown, links, strict=True)], user.id
-                ),
+                reply_markup=await self._notice_buttons(missing, user),
                 message_thread_id=message.message_thread_id if message.is_topic_message else None,
                 disable_notification=True,
                 link_preview_options=NO_PREVIEW,
@@ -507,6 +505,35 @@ class Moderator:
         else:
             delay = 0  # пока отправляли, человек подписался и написал — подсказка уже не нужна
         self._later(self._delete_quietly(info.tg_id, sent.message_id, delay))
+
+    async def _notice_buttons(self, missing: Sequence[Chat], user: User) -> Any:
+        """Клавиатура подсказки: новые личные ссылки на каналы и «✅ Проверить подписку»."""
+        shown = missing[:MAX_NOTICE_CHANNELS]
+        links = await asyncio.gather(*(self.personal_link(channel, user) for channel in shown))
+        return keyboards.sub_notice([(c.title, link) for c, link in zip(shown, links, strict=True)], user.id)
+
+    async def refresh_notice(self, info: ChatInfo, notice: Message, user: User, missing: Sequence[Chat]) -> bool:
+        """Новые личные ссылки в подсказке: кнопки-ссылки нажимает кто угодно, и одноразовую ссылку мог
+        занять другой человек. Не чаще раза в NOTICE_REFRESH на подсказку. True — ссылки обновлены."""
+        key = (info.tg_id, notice.message_id)
+        if not missing or self._refreshed.get(key) is not _MISSING:
+            return False
+        self._refreshed.set(key, True, NOTICE_REFRESH)
+        try:
+            await self.app.bot.edit_message_reply_markup(
+                chat_id=info.tg_id, message_id=notice.message_id, reply_markup=await self._notice_buttons(missing, user)
+            )
+        except TelegramAPIError as error:
+            logger.info("Не удалось обновить ссылки в подсказке «%s»: %s", info.title, error)
+            return False
+        return True
+
+    async def is_moderator(self, info: ChatInfo, user: User) -> bool:
+        """Админ бота, скрытый админ или админ чата."""
+        if user.id in self.app.admin_ids or info.is_trusted(user.id, user.username):
+            return True
+        admins = await self.chat_admins(info)
+        return admins is not None and user.id in admins
 
     def notice_done(self, tg_id: int, user_id: int) -> int | None:
         """Человек подписался: забыть его подсказку — если снова отпишется, новая появится сразу.

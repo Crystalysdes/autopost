@@ -50,24 +50,46 @@ async def on_join_request(request: ChatJoinRequest, app: App) -> None:
 async def on_sub_check(
     callback: CallbackQuery, callback_data: SubCheck, app: App, callback_answer: CallbackAnswer
 ) -> None:
-    """«✅ Проверить подписку»: проверяет того, кто нажал, без кэша. Подписан — подсказка исчезает
-    (если она адресована ему) и можно писать."""
+    """«✅ Проверить подписку». Кнопку видят все, но работает она только для того, к кому обращается
+    подсказка. Админам она показывает, подписан ли он; остальным — что кнопка не для них."""
     notice = callback.message
-    if app.moderator is None or not isinstance(notice, Message):
+    moderator = app.moderator
+    if moderator is None or not isinstance(notice, Message):
         callback_answer.text = "Подсказка устарела — просто напишите сообщение ещё раз"
         return
-    info = await app.moderator.chat_info(notice.chat.id)
-    missing = await app.moderator.missing_channels(callback.from_user.id, info.channels, fresh=True) if info else []
+    info = await moderator.chat_info(notice.chat.id)
+    user = callback.from_user
+    if user.id != callback_data.u:
+        if info is None or not await moderator.is_moderator(info, user):
+            callback_answer.text = "🔒 Эта кнопка — для участника, к которому обращается подсказка"
+            callback_answer.show_alert = True
+            return
+        # Админ смотрит, подписался ли адресат. Писать тот сможет, только подписавшись сам.
+        missing = await moderator.missing_channels(callback_data.u, info.channels, fresh=True)
+        callback_answer.show_alert = True
+        if missing:
+            titles = ", ".join(f"«{c.title}»" for c in missing)
+            status = f"Участник ещё не подписан на: {titles} — писать не сможет, пока не подпишется."
+            callback_answer.text = status[:200]
+            return
+        callback_answer.text = "✅ Участник уже подписан и может писать — подсказку убрал"
+        moderator.notice_done(notice.chat.id, callback_data.u)
+        with contextlib.suppress(TelegramAPIError):
+            await notice.delete()
+        return
+
+    missing = await moderator.missing_channels(user.id, info.channels, fresh=True) if info else []
     if missing:
+        refreshed = info is not None and await moderator.refresh_notice(info, notice, user, missing)
         callback_answer.text = (
             "Вы ещё не подписаны на: "
             + ", ".join(f"«{c.title}»" for c in missing)
             + ". Подпишитесь по кнопке в подсказке и нажмите «Проверить подписку» ещё раз."
+            + (" Ссылки в подсказке обновлены." if refreshed else "")
         )[:200]
         callback_answer.show_alert = True
         return
     callback_answer.text = "✅ Спасибо! Теперь можно писать"
-    if callback.from_user.id == callback_data.u:
-        app.moderator.notice_done(notice.chat.id, callback.from_user.id)
-        with contextlib.suppress(TelegramAPIError):
-            await notice.delete()
+    moderator.notice_done(notice.chat.id, user.id)
+    with contextlib.suppress(TelegramAPIError):
+        await notice.delete()
