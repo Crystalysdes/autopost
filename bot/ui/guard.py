@@ -1,4 +1,4 @@
-"""Экраны защиты чатов: антиспам, обязательная подписка и автоприём заявок."""
+"""Экраны защиты чатов: антиспам, обязательная подписка, автоприём заявок и скрытые админы."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton
 
 from bot.app import App
 from bot.db.models import Chat, now_ts
-from bot.services import spam
+from bot.services import spam, trusted
 from bot.services.moderation import GROUP_TYPES, auto_approve_on, required_channels
 from bot.ui import texts as t
 from bot.ui.callbacks import Guard, Nav
@@ -17,6 +17,8 @@ from bot.ui.render import Screen
 
 MAX_CHANNELS = 40
 MAX_JOIN_CHATS = 40  # галочек на экране автоприёма; остальные чаты — на их экранах
+MAX_TRUSTED_BUTTONS = 40  # кнопок «❌» на экране скрытых админов
+MAX_TARGET_GROUPS = 40  # групп на экране «Куда добавить?»
 LOG_LIMIT = 10
 # Порядок переключателей на экране (в callback — имя правила)
 UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service")
@@ -101,7 +103,11 @@ async def protection_view(app: App, chat_id: int, note: str | None = None) -> Sc
         sub_line = "Подписка: свои каналы не выбраны — пока писать можно без подписки."
     else:
         sub_line = "Подписка: общие каналы не выбраны (⚙️ Настройки → 🔒 Обязательная подписка)."
-    lines += [sub_line, "Админы чата и бота не проверяются.", "", await _counts_line(app, chat.id)]
+    own_trusted = trusted.clean_list(chat.trusted)
+    lines += [sub_line, "Админы чата и бота, а также скрытые админы не проверяются."]
+    if own_trusted or app.settings.trusted:
+        lines.append(f"🕶 Скрытые админы: {len(own_trusted)} в этом чате · {len(app.settings.trusted)} во всех группах")
+    lines += ["", await _counts_line(app, chat.id)]
     if chat.can_delete is False:
         lines += ["", "⚠️ У бота нет права «Удаление сообщений» — защита не работает. Выдайте его в чате."]
     problems = [f"⚠️ «{t.esc(c.title, 30)}»: {p}" for c in channels if (p := channel_problem(c))]
@@ -134,6 +140,7 @@ async def protection_view(app: App, chat_id: int, note: str | None = None) -> Sc
     )
     if chat.sub_mode == "own":
         rows.append([btn(f"📢 Каналы этого чата ({len(chat.sub_channels or [])})", Guard(a="ch", id=cid))])
+    rows.append([btn(f"🕶 Скрытые админы ({len(own_trusted)})", Guard(a="trust", id=cid))])
     rows.append([btn("🗒 Последние удалённые", Guard(a="log", id=cid))])
     rows.append([btn("« К чату", Nav(to="chat", id=cid))])
     return "\n".join(lines), markup(*rows)
@@ -219,7 +226,8 @@ async def spam_settings_view(app: App, note: str | None = None) -> Screen:
         "",
         "Бот молча удаляет спам участников групп: ссылки, пересылки, @ботов и @каналы, сообщения через ботов "
         "и от имени каналов, стоп-слова, контакты, рекламу в имени, сообщения о входе и выходе. Админы чатов "
-        "и бота не проверяются. Что считать спамом в конкретном чате — на экране чата («🛡 Защита»).",
+        "и бота, а также скрытые админы не проверяются. Что считать спамом в конкретном чате — на экране чата "
+        "(«🛡 Защита»).",
         "",
         f"Включён в группах: <b>{enabled}</b> из {len(groups)}",
         f"🚫 Стоп-слова: {len(words) if words is not None else len(spam.DEFAULT_STOP_WORDS)}"
@@ -252,7 +260,7 @@ async def sub_settings_view(app: App, note: str | None = None) -> Screen:
         "Участники групп смогут писать, только подписавшись на выбранные каналы. Сообщение неподписанного бот "
         "сразу удаляет и на 5 минут показывает подсказку: каждому человеку — новые личные ссылки-приглашения "
         "на каналы и кнопка «✅ Проверить подписку». Подписался и нажал — подсказка исчезает, можно писать. "
-        "Админы чатов и бота не проверяются.",
+        "Админы чатов и бота, а также скрытые админы не проверяются.",
         "",
         f"Для личных ссылок боту нужно право {t.INVITE_RIGHT} в каждом канале.",
         "",
@@ -323,6 +331,86 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
         ]
     )
     rows.append([btn("« Настройки", Nav(to="settings"))])
+    return "\n".join(lines), markup(*rows)
+
+
+# ---------------------------------------------------------------- скрытые админы
+
+
+def _trusted_line(entry: trusted.Entry) -> str:
+    parts = ["📢 " + t.esc(entry["name"] or "канал", 40) if trusted.is_channel(entry) else t.esc(entry["name"], 40)]
+    if entry.get("username"):
+        parts.append(f"@{t.esc(entry['username'])}")
+    if entry.get("id") is not None:
+        parts.append(f"<code>{entry['id']}</code>")
+    return " · ".join(part for part in parts if part)
+
+
+async def trusted_view(app: App, chat_id: int, note: str | None = None) -> Screen | None:
+    """Скрытые админы: chat_id=0 — во всех группах, иначе только в этом чате."""
+    chat = await app.repo.get_chat(chat_id) if chat_id else None
+    if chat_id and (chat is None or chat.type not in GROUP_TYPES):
+        return None
+    common = app.settings.trusted
+    own = trusted.clean_list(chat.trusted) if chat else common
+    lines = [
+        f"<b>🕶 Скрытые админы · «{t.esc(chat.title)}»</b>" if chat else "<b>🕶 Скрытые админы</b>",
+        "",
+        "Их сообщения защита не удаляет: ссылки, пересылки, рекламу, стоп-слова, сообщения без подписки "
+        "на каналы — как у настоящих админов чата. В самом чате они не видны как админы, а к панели бота "
+        "доступа не получают.",
+        "",
+    ]
+    where = "Только в этом чате" if chat else "Во всех группах"
+    lines.append(f"{where}:" if own else f"{where}: пока никого.")
+    lines += [f"• {_trusted_line(entry)}" for entry in own]
+    if chat and common:
+        names = t.names_label([trusted.label(entry) for entry in common], 5, 30)
+        lines += ["", f"Плюс во всех группах ({len(common)}): {names} — «⚙️ Настройки → 🕶 Скрытые админы»."]
+    if any(entry.get("id") is None for entry in own):
+        lines += [
+            "",
+            "ℹ️ Добавленных по @username бот узнаёт, пока они не сменят юзернейм. Надёжнее — кнопкой "
+            "«🕶 Добавить скрытого админа» внизу экрана или пересылкой сообщения.",
+        ]
+    if note:
+        lines += ["", note]
+    rows: list[list[InlineKeyboardButton] | None] = [[btn("➕ Добавить", Guard(a="tadd", id=chat_id), GREEN)]]
+    rows += [
+        [btn(f"❌ {t.cut(trusted.label(entry), 40)}", Guard(a="tdel", id=chat_id, v=trusted.code(entry)))]
+        for entry in own[:MAX_TRUSTED_BUTTONS]
+    ]
+    rows.append(
+        [btn("« Защита чата", Guard(a="chat", id=chat.id))] if chat else [btn("« Настройки", Nav(to="settings"))]
+    )
+    return "\n".join(lines), markup(*rows)
+
+
+def trusted_prompt_text(chat: Chat | None) -> str:
+    where = f"в «{t.esc(chat.title)}»" if chat else "во всех группах"
+    return (
+        f"<b>🕶 Добавить скрытого админа</b> {where}\n\n"
+        "• Нажмите «🕶 Добавить скрытого админа» внизу экрана и выберите людей (нет кнопки — отправьте /start);\n"
+        "• или перешлите сюда любое сообщение этого человека — или пост канала, от имени которого он пишет;\n"
+        "• или пришлите @username или ID — можно несколько, через запятую или с новой строки."
+    )
+
+
+async def trusted_target_view(app: App, entries: Sequence[trusted.Entry]) -> Screen:
+    """Люди выбраны кнопкой внизу экрана — куда их добавить."""
+    groups = await active_groups(app)
+    names = t.names_label([trusted.label(entry) for entry in entries], 10, 40)
+    lines = [
+        "<b>🕶 Скрытые админы</b>",
+        "",
+        f"Выбраны: {names}.",
+        "Куда добавить? Защита не будет удалять их сообщения.",
+    ]
+    if len(groups) > MAX_TARGET_GROUPS:
+        lines += ["", f"Показаны первые {MAX_TARGET_GROUPS} групп."]
+    rows: list[list[InlineKeyboardButton] | None] = [[btn("🌐 Во всех группах", Guard(a="tput", id=0), GREEN)]]
+    rows += [[btn(f"👥 {t.cut(g.title, 40)}", Guard(a="tput", id=g.id))] for g in groups[:MAX_TARGET_GROUPS]]
+    rows.append([btn("✖️ Отмена", Nav(to="main"))])
     return "\n".join(lines), markup(*rows)
 
 

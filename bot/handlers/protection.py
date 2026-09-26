@@ -1,4 +1,5 @@
-"""Настройка защиты групп: антиспам и обязательная подписка (экраны — bot/ui/guard.py)."""
+"""Настройка защиты чатов: антиспам, обязательная подписка, автоприём заявок и скрытые админы
+(экраны — bot/ui/guard.py)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
-from bot.services import spam
+from bot.services import spam, trusted
 from bot.states import Input
 from bot.ui import guard, screens
 from bot.ui import texts as t
@@ -301,3 +302,152 @@ async def join_everywhere(callback: CallbackQuery, callback_data: Guard, app: Ap
     await app.repo.reset_auto_approve()
     note = "✅ Автоприём включён во всех чатах и каналах" if on else "⏸ Автоприём выключен во всех чатах и каналах"
     await show(app, callback, await guard.joins_view(app, note))
+
+
+# ---------------------------------------------------------------- скрытые админы
+
+
+async def _trusted(app: App, event: Message | CallbackQuery, chat_id: int, note: str | None = None) -> None:
+    screen = await guard.trusted_view(app, chat_id, note)
+    await show(app, event, screen or await screens.chats_list(app))
+
+
+async def _add_trusted(app: App, chat_id: int, entries: list[trusted.Entry]) -> list[trusted.Entry] | None:
+    """Добавляет в общий список (chat_id=0) или в список чата. None — чат уже удалён."""
+    if chat_id:
+        chat = await app.repo.get_chat(chat_id)
+        if chat is None:
+            return None
+        merged, added = trusted.merge(trusted.clean_list(chat.trusted), entries)
+        await app.repo.update_chat(chat.id, trusted=merged)
+        _forget(app, chat.tg_id)
+    else:
+        merged, added = trusted.merge(app.settings.trusted, entries)
+        await app.settings.set_list(app.repo, "trusted", merged)
+        _forget(app)
+    return added
+
+
+async def _add_and_show(app: App, event: Message | CallbackQuery, chat_id: int, entries: list[trusted.Entry]) -> None:
+    added = await _add_trusted(app, chat_id, entries)
+    if added is None:
+        await show(app, event, await screens.chats_list(app))
+        return
+    if added:
+        note = "✅ Добавлены: " + t.names_label([trusted.label(entry) for entry in added], 10, 40)
+    elif len(await _current_trusted(app, chat_id)) >= trusted.MAX_TRUSTED:
+        note = f"⚠️ В списке уже {trusted.MAX_TRUSTED} — уберите лишних, чтобы добавить новых."
+    else:
+        note = "Они уже в списке."
+    await _trusted(app, event, chat_id, note)
+
+
+async def _current_trusted(app: App, chat_id: int) -> list[trusted.Entry]:
+    if not chat_id:
+        return app.settings.trusted
+    chat = await app.repo.get_chat(chat_id)
+    return trusted.clean_list(chat.trusted) if chat else []
+
+
+@router.callback_query(Guard.filter(F.a == "trust"))
+async def open_trusted(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
+    await _trusted(app, callback, callback_data.id)
+
+
+@router.callback_query(Guard.filter(F.a == "tadd"))
+async def ask_trusted(
+    callback: CallbackQuery, callback_data: Guard, state: FSMContext, app: App, callback_answer: CallbackAnswer
+) -> None:
+    chat = None
+    if callback_data.id:
+        chat = await _chat_or_gone(callback, callback_data, app, callback_answer)
+        if chat is None:
+            return
+    await prompt(
+        app,
+        callback,
+        state,
+        Input.trusted,
+        guard.trusted_prompt_text(chat),
+        cancel=Guard(a="trust", id=callback_data.id),
+        target=callback_data.id,
+    )
+
+
+@router.message(F.users_shared)
+async def on_users_shared(message: Message, state: FSMContext, app: App) -> None:
+    """Люди выбраны кнопкой «🕶 Добавить скрытого админа» внизу экрана. Если админ как раз добавляет
+    скрытых админов в чат (или во все группы) — туда, иначе бот спросит, куда."""
+    entries = [trusted.from_shared(user) for user in message.users_shared.users]
+    if not entries:
+        return
+    if await state.get_state() == Input.trusted.state:
+        chat_id = int((await state.get_data()).get("target") or 0)
+        await finish_input(app, message, state)
+        await _add_and_show(app, message, chat_id, entries)
+        return
+    app.picked[message.from_user.id] = entries
+    await show(app, message, await guard.trusted_target_view(app, entries))
+
+
+@router.callback_query(Guard.filter(F.a == "tput"))
+async def put_picked(callback: CallbackQuery, callback_data: Guard, app: App, callback_answer: CallbackAnswer) -> None:
+    entries = app.picked.pop(callback.from_user.id, None)
+    if not entries:
+        callback_answer.text = "Выбор устарел — выберите людей ещё раз кнопкой «🕶 Добавить скрытого админа» внизу"
+        callback_answer.show_alert = True
+        return
+    await _add_and_show(app, callback, callback_data.id, entries)
+
+
+@router.message(Input.trusted)
+async def on_trusted(message: Message, state: FSMContext, app: App) -> None:
+    """Пересланное сообщение человека (или поста канала), либо @username / ID текстом."""
+    if message.forward_origin is not None:
+        entry = trusted.from_forward(message.forward_origin)
+        if entry is None:
+            await message.reply(
+                "⚠️ Этот человек скрыл пересылку своих сообщений — бот не видит, кто это. Выберите его кнопкой "
+                "«🕶 Добавить скрытого админа» внизу экрана или пришлите @username."
+            )
+            return
+        entries = [entry]
+    elif message.text:
+        entries, wrong = trusted.parse_text(message.text)
+        if wrong or not entries:
+            example = t.esc(wrong[0], 60) if wrong else ""
+            await message.reply(
+                "⚠️ Не похоже на @username или ID"
+                + (f": <code>{example}</code>" if example else "")
+                + ".\nПримеры: <code>@ivan_petrov</code>, <code>123456789</code>."
+            )
+            return
+    else:
+        await message.reply(
+            "Перешлите сообщение этого человека, пришлите @username или ID — или выберите его кнопкой внизу экрана."
+        )
+        return
+    chat_id = int((await state.get_data()).get("target") or 0)
+    await finish_input(app, message, state)
+    await _add_and_show(app, message, chat_id, entries)
+
+
+@router.callback_query(Guard.filter(F.a == "tdel"))
+async def remove_trusted(
+    callback: CallbackQuery, callback_data: Guard, app: App, callback_answer: CallbackAnswer
+) -> None:
+    if callback_data.id:
+        chat = await _chat_or_gone(callback, callback_data, app, callback_answer)
+        if chat is None:
+            return
+        entries, removed = trusted.remove(trusted.clean_list(chat.trusted), callback_data.v)
+        if removed:
+            await app.repo.update_chat(chat.id, trusted=entries)
+            _forget(app, chat.tg_id)
+    else:
+        entries, removed = trusted.remove(app.settings.trusted, callback_data.v)
+        if removed:
+            await app.settings.set_list(app.repo, "trusted", entries)
+            _forget(app)
+    callback_answer.text = f"Убран: {trusted.label(removed)}"[:200] if removed else "Уже убран"
+    await _trusted(app, callback, callback_data.id)

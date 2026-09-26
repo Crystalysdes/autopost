@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     KeyboardButtonRequestChat,
+    KeyboardButtonRequestUsers,
     ReplyKeyboardMarkup,
 )
 
@@ -20,7 +21,8 @@ GREEN, RED, BLUE = "success", "danger", "primary"
 
 ADD_GROUP_TEXT = "➕ Добавить группу"
 ADD_CHANNEL_TEXT = "➕ Добавить канал"
-REQUEST_GROUP, REQUEST_CHANNEL = 1, 2
+REQUEST_GROUP, REQUEST_CHANNEL, REQUEST_TRUSTED = 1, 2, 3
+ADD_TRUSTED_TEXT = "🕶 Добавить скрытого админа"
 
 
 def btn(text: str, data: CallbackData | str, style: str | None = None) -> InlineKeyboardButton:
@@ -117,7 +119,8 @@ def _rights(**enabled: bool) -> ChatAdministratorRights:
 
 
 def add_chat_reply() -> ReplyKeyboardMarkup:
-    """Нижняя клавиатура: нативный выбор чата. Telegram сам добавит бота админом с нужными правами."""
+    """Нижняя клавиатура: нативный выбор чата (Telegram сам добавит бота админом с нужными правами)
+    и выбор людей в скрытые админы."""
     # Право приглашать нужно, чтобы Telegram присылал боту заявки на вступление (автоприём)
     group_rights = _rights(can_delete_messages=True, can_pin_messages=True, can_invite_users=True)
     # В канале это право ещё и для личных ссылок в подсказке об обязательной подписке
@@ -149,7 +152,20 @@ def add_chat_reply() -> ReplyKeyboardMarkup:
                         request_username=True,
                     ),
                 ),
-            ]
+            ],
+            [
+                # Нативный выбор людей: Telegram пришлёт их id и имена (users_shared)
+                KeyboardButton(
+                    text=ADD_TRUSTED_TEXT,
+                    request_users=KeyboardButtonRequestUsers(
+                        request_id=REQUEST_TRUSTED,
+                        user_is_bot=False,
+                        max_quantity=10,
+                        request_name=True,
+                        request_username=True,
+                    ),
+                )
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,

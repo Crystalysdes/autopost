@@ -48,6 +48,8 @@ class Chat(Base):
     sub_channels: Mapped[list[int] | None] = mapped_column(JSON, default=None)
     # Автоприём заявок на вступление: None — как в общих настройках, True/False — выбрано для этого чата
     auto_approve: Mapped[bool | None] = mapped_column(default=None)
+    # Скрытые админы только этого чата: [{"id", "username", "name"}] (см. bot/services/trusted.py)
+    trusted: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=None)
     added_by: Mapped[int | None] = mapped_column(BigInteger, default=None)
     created_ts: Mapped[int] = mapped_column(default=now_ts)
     updated_ts: Mapped[int] = mapped_column(default=now_ts, onupdate=now_ts)

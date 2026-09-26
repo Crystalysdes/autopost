@@ -19,6 +19,7 @@ class Input(StatesGroup):
     timezone = State()
     spam_words = State()
     spam_allow = State()
+    trusted = State()  # скрытые админы: пересылка, @username или ID
 
 
 class Picker(StatesGroup):

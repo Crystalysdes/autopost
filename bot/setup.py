@@ -41,20 +41,22 @@ def build_dispatcher(app: App, *, album_latency: float = 0.8, double_tap_window:
     dp.message.outer_middleware(AlbumMiddleware(latency=album_latency))
     dp.callback_query.middleware(CallbackAnswerMiddleware())
 
-    # Порядок важен: команды и навигация — первыми (они сбрасывают ввод), fallback — последним
+    # Порядок важен: команды и навигация — первыми (они сбрасывают ввод), fallback — последним.
+    # Выбор чата или человека кнопками внизу экрана (chats, protection) — раньше постов,
+    # иначе во время приёма постов он стал бы постом.
     dp.include_routers(
         common.router,
         chat_member.router,
         group_events.router,
         moderation.router,
         chats.router,
+        protection.router,
         campaigns.router,
         posts.router,
         schedule.router,
         options.router,
         targets.router,
         library.router,
-        protection.router,
         drafts.router,
         settings.router,
         fallback.router,

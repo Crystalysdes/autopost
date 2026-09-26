@@ -5,7 +5,8 @@
 
 Порядок для каждого сообщения:
 1. служебные сообщения: вход/выход удаляются (если включено), остальные не трогаются;
-2. сразу пропускаются админы бота, анонимные админы чата и посты привязанного канала;
+2. сразу пропускаются админы бота, скрытые админы (bot/services/trusted.py), анонимные админы чата
+   и посты привязанного канала;
 3. антиспам: если сообщение похоже на спам и автор не админ чата — молча удалить;
 4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
    с новыми личными ссылками-приглашениями на каналы.
@@ -37,7 +38,7 @@ from bot.app import NO_PREVIEW, App
 from bot.db.models import Chat
 from bot.db.repo import JOIN_REASON
 from bot.services import chats as chat_service
-from bot.services import spam
+from bot.services import spam, trusted
 from bot.services.errors import humanize
 from bot.services.rights import enum_text
 from bot.ui import keyboards, texts
@@ -113,6 +114,12 @@ class ChatInfo:
     rules: spam.SpamRules
     allow: spam.Allowlist
     channels: tuple[int, ...]  # id записей каналов, на которые нужна подписка
+    # Скрытые админы: общий список плюс список чата (id людей и каналов, юзернеймы)
+    trusted_ids: frozenset[int] = frozenset()
+    trusted_names: frozenset[str] = frozenset()
+
+    def is_trusted(self, ident: int, username: str | None) -> bool:
+        return ident in self.trusted_ids or bool(username and username.lower() in self.trusted_names)
 
 
 @dataclass
@@ -165,6 +172,9 @@ class Moderator:
         chat = await self.app.repo.get_chat_by_tg(tg_id)
         info = None
         if chat is not None and chat.status == "active" and chat.type in GROUP_TYPES:
+            trusted_ids, trusted_names = trusted.match_sets(
+                [*self.app.settings.trusted, *trusted.clean_list(chat.trusted)]
+            )
             info = ChatInfo(
                 id=chat.id,
                 tg_id=chat.tg_id,
@@ -172,6 +182,8 @@ class Moderator:
                 rules=spam.SpamRules.of(chat.spam_filter),
                 allow=spam.build_allowlist(self.app.settings.spam_allow, [chat.username, self.app.bot_username]),
                 channels=required_channels(chat, self.app.settings.sub_channels),
+                trusted_ids=trusted_ids,
+                trusted_names=trusted_names,
             )
         self._chats.set(tg_id, info, CHAT_TTL)
         return info
@@ -192,7 +204,7 @@ class Moderator:
             if not edited and info.rules.enabled("service"):
                 await self._delete(info, [message.message_id])
             return
-        if not spam.has_user_content(message) or self._always_allowed(message):
+        if not spam.has_user_content(message) or self._always_allowed(info, message):
             return
 
         album = self._album(info, message)
@@ -234,13 +246,18 @@ class Moderator:
         if reason == "sub" and user is not None and not self._is_backlog(message):
             await self._notice(info, message)
 
-    def _always_allowed(self, message: Message) -> bool:
+    def _always_allowed(self, info: ChatInfo, message: Message) -> bool:
         if message.is_automatic_forward:
             return True
-        if message.sender_chat is not None and message.sender_chat.id == message.chat.id:
-            return True  # анонимный админ пишет от имени группы
+        sender = message.sender_chat
+        if sender is not None:  # от имени группы (анонимный админ) или канала из скрытых админов
+            return sender.id == message.chat.id or info.is_trusted(sender.id, sender.username)
         user = message.from_user
-        return user is not None and (user.id in self.app.admin_ids or user.id == TELEGRAM_SERVICE_ID)
+        if user is None:
+            return False
+        return (
+            user.id in self.app.admin_ids or user.id == TELEGRAM_SERVICE_ID or info.is_trusted(user.id, user.username)
+        )
 
     @staticmethod
     def _needs_subscription(info: ChatInfo, message: Message, edited: bool) -> bool:

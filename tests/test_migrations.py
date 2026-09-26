@@ -99,6 +99,7 @@ async def test_v1_database_is_migrated(tmp_path):
         # Колонки новых функций дописаны сами: автоприём заявок — по общей настройке (включён)
         chat = await repo.get_chat(ids["a"])
         assert chat.auto_approve is None and chat.spam_filter is None and chat.sub_mode is None
+        assert chat.trusted is None  # скрытых админов у чата нет
     finally:
         await db.close()
 

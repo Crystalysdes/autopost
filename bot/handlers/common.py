@@ -57,7 +57,7 @@ async def cmd_start(message: Message, state: FSMContext, app: App) -> None:
     if message.from_user.id not in app.commands_ready:
         app.commands_ready |= await setup_commands(app.bot, [message.from_user.id])
     await message.answer(
-        "👋 Панель автопостинга. Кнопки внизу экрана добавляют бота в группу или канал.",
+        "👋 Панель автопостинга. Кнопки внизу экрана добавляют бота в группу или канал, а также скрытых админов.",
         reply_markup=keyboards.add_chat_reply(),
     )
     await show(app, message, await screens.main_menu(app))

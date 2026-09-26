@@ -15,6 +15,7 @@ from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions
 from bot.config import Config
 from bot.db.base import Database
 from bot.db.repo import Repo
+from bot.services import trusted
 
 if TYPE_CHECKING:
     from bot.services.moderation import Moderator
@@ -39,6 +40,8 @@ class AppSettings:
         self.sub_channels: list[int] = []  # общие каналы обязательной подписки (id записей чатов)
         # Автоприём заявок в чатах, где он не выбран отдельно (в том числе в новых)
         self.join_auto = True
+        # Скрытые админы во всех группах (см. bot/services/trusted.py)
+        self.trusted: list[dict[str, Any]] = []
 
     @property
     def tz(self) -> ZoneInfo:
@@ -57,7 +60,7 @@ class AppSettings:
             self.notify_errors = value == "1"
         elif key == "join_auto":
             self.join_auto = value == "1"
-        elif key in ("spam_words", "spam_allow", "sub_channels"):
+        elif key in ("spam_words", "spam_allow", "sub_channels", "trusted"):
             self._apply_list(key, value)
 
     def _apply_list(self, key: str, value: str) -> None:
@@ -72,6 +75,8 @@ class AppSettings:
             self.spam_words = [str(item) for item in data]
         elif key == "spam_allow":
             self.spam_allow = [str(item) for item in data]
+        elif key == "trusted":
+            self.trusted = trusted.clean_list(data)
         else:
             self.sub_channels = [int(item) for item in data if isinstance(item, int)]
 
@@ -108,6 +113,8 @@ class App:
     commands_ready: set[int] = field(default_factory=set)
     # Из какого чата админ открыл рассылку: туда ведёт «« Назад» (после перезапуска — к списку рассылок)
     origins: dict[tuple[int, int], int] = field(default_factory=dict)
+    # Люди, выбранные кнопкой «🕶 Добавить скрытого админа», пока админ не решил, куда их добавить
+    picked: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
 
     @property
     def admin_ids(self) -> tuple[int, ...]:
