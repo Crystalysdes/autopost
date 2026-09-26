@@ -89,7 +89,8 @@ async def test_toggles_change_what_is_deleted(feed, app, session, moderator):
 
 def _all_on() -> dict[str, bool]:
     return {
-        name: True for name in ("on", "links", "bots", "forwards", "channels", "words", "contacts", "names", "service")
+        name: True
+        for name in ("on", "links", "bots", "forwards", "channels", "words", "length", "contacts", "names", "service")
     }
 
 
@@ -196,3 +197,32 @@ def test_callback_data_fits_limit():
     big = 2**31 - 1
     for sample in (Guard(a="r_forwards", id=big, v=big), Guard(a="spam_all", v=1), SubCheck(u=10**12)):
         assert len(sample.pack().encode()) <= 64, sample
+
+
+async def test_max_length_setting(feed, dp, bot, app, session, moderator):
+    group = await add_chat(feed, app, GROUP)
+    await feed(press(Guard(a="spam_set")))
+    assert "📏 Длина сообщения: без ограничения" in owner_texts(session)[-1]
+    await feed(press(Guard(a="maxlen")))
+    assert await state_of(dp, bot) == Input.spam_max_len.state
+
+    for wrong in ("много", "5", "99999"):
+        await feed(private_message(wrong))
+        assert "Нужно число" in owner_texts(session)[-1]
+    assert await state_of(dp, bot) == Input.spam_max_len.state
+
+    await feed(private_message("100"))
+    assert app.settings.spam_max_len == 100 and await state_of(dp, bot) is None
+    assert "до 100 символов" in owner_texts(session)[-1]
+    await feed(group_text("а" * 150))
+    assert len(group_deletes(session)) == 1  # длиннее лимита — удалено
+    await feed(group_text("Коротко"))
+    assert len(group_deletes(session)) == 1
+
+    await feed(press(Guard(a="r_length", id=group.id, v=0)))  # в этом чате длинные можно
+    await feed(group_text("б" * 150))
+    assert len(group_deletes(session)) == 1
+
+    await feed(press(Guard(a="maxlen_off")))
+    assert app.settings.spam_max_len == 0
+    assert (await app.repo.load_settings())["spam_max_len"] == "0"

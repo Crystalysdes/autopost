@@ -51,6 +51,7 @@ SUBSCRIBED = {"creator", "administrator", "member"}
 
 CHAT_TTL = 60  # настройки чата (правки из бота сбрасывают кэш сразу)
 ADMINS_TTL = 600
+ADMINS_REFRESH = 60  # перечитать админов чата раньше срока — не чаще (новый админ пишет команду)
 LINKED_TTL = 3600
 MENTION_TTL = 24 * 3600
 SUB_YES_TTL = 15 * 60
@@ -67,6 +68,7 @@ BACKLOG_SECONDS = 120  # сообщения старше (пришли, пока
 PROBLEM_INTERVAL = 24 * 3600  # одинаковые предупреждения админам — не чаще раза в сутки
 MAX_MENTION_CHECKS = 5  # @ников на одно сообщение, которые проверяем через Telegram
 RETRY_AFTER_LIMIT = 30
+HINT_LIFETIME = 7  # подсказки админу в чате (ошибка команды) удаляются сами
 JOIN_ATTEMPTS = 3  # заявку при лимите Telegram пробуем принять несколько раз
 JOIN_RETRY_LIMIT = 300  # и ждём ради этого не дольше (каждая заявка обрабатывается отдельно)
 # Заявку уже рассмотрели (приняли вручную, человек отозвал её или уже в чате) — принимать нечего
@@ -139,8 +141,10 @@ class Moderator:
         self.app = app
         self.wall = wall
         self.notice_lifetime: float = NOTICE_LIFETIME
+        self.hint_lifetime: float = HINT_LIFETIME
         self._chats = TTLCache(clock)
-        self._admins = TTLCache(clock)
+        self._admins = TTLCache(clock)  # {id: ChatMember} админов чата, None — узнать не вышло
+        self._admins_fresh = TTLCache(clock)  # чаты, где список админов недавно перечитан
         self._linked = TTLCache(clock)
         self._mentions = TTLCache(clock)
         self._subs = TTLCache(clock)
@@ -201,7 +205,9 @@ class Moderator:
         if info is None:
             return
         if spam.is_join_leave(message):
-            if not edited and info.rules.enabled("service"):
+            # «Бот удалил X» после /ban — служебное сообщение самого бота, убираем всегда
+            by_bot = message.from_user is not None and message.from_user.id == self.app.bot_id
+            if not edited and (info.rules.enabled("service") or by_bot):
                 await self._delete(info, [message.message_id])
             return
         if not spam.has_user_content(message) or self._always_allowed(info, message):
@@ -282,7 +288,13 @@ class Moderator:
     async def _spam_reason(self, info: ChatInfo, message: Message) -> str | None:
         if not info.rules.on:
             return None
-        verdict = spam.detect(message, info.rules, stop_words=self.stop_words(), allow=info.allow)
+        verdict = spam.detect(
+            message,
+            info.rules,
+            stop_words=self.stop_words(),
+            allow=info.allow,
+            max_len=self.app.settings.spam_max_len,
+        )
         if verdict.reason is None and verdict.mentions and await self._any_public_chat(verdict.mentions):
             return "bots"
         return verdict.reason
@@ -312,17 +324,46 @@ class Moderator:
         user = message.from_user
         if user is None:
             return False
+        admins = await self.chat_admins(info)
+        return admins is None or user.id in admins
+
+    async def chat_admins(self, info: ChatInfo, *, fresh: bool = False) -> dict[int, Any] | None:
+        """Админы чата с их правами: {id: ChatMember}. None — узнать не вышло.
+        fresh — перечитать сейчас (не чаще раза в ADMINS_REFRESH): человека могли только что назначить."""
         admins = self._admins.get(info.tg_id)
+        if fresh and self._admins_fresh.get(info.tg_id) is _MISSING:
+            admins = _MISSING
         if admins is _MISSING:
+            self._admins_fresh.set(info.tg_id, True, ADMINS_REFRESH)
             try:
                 members = await self.app.bot.get_chat_administrators(info.tg_id)
-                admins = frozenset(member.user.id for member in members)
+                admins = {member.user.id: member for member in members}
                 self._admins.set(info.tg_id, admins, ADMINS_TTL)
             except TelegramAPIError as error:
                 logger.warning("Не удалось получить админов «%s»: %s", info.title, error)
                 self._admins.set(info.tg_id, None, 60)
                 admins = None
-        return admins is None or user.id in admins
+        return admins
+
+    async def hint(self, info: ChatInfo, message: Message, text: str) -> None:
+        """Короткая подсказка в чате (в ту же тему форума), которая сама исчезает через несколько секунд."""
+        try:
+            sent = await self.app.bot.send_message(
+                info.tg_id,
+                text,
+                message_thread_id=message.message_thread_id if message.is_topic_message else None,
+                disable_notification=True,
+                link_preview_options=NO_PREVIEW,
+            )
+        except TelegramAPIError as error:
+            logger.info("Не удалось показать подсказку в «%s»: %s", info.title, error)
+            return
+        self._live.add((info.tg_id, sent.message_id))
+        self._later(self._delete_quietly(info.tg_id, sent.message_id, self.hint_lifetime))
+
+    async def delete_message(self, info: ChatInfo, message_id: int) -> bool:
+        """Удалить сообщение в чате (для команд админов). False — не вышло, админам уже сообщено."""
+        return await self._delete(info, [message_id])
 
     async def _linked_chat_id(self, info: ChatInfo) -> int | None:
         linked = self._linked.get(info.tg_id)

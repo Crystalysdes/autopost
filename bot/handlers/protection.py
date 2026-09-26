@@ -254,6 +254,40 @@ async def clear_allow(callback: CallbackQuery, state: FSMContext, app: App) -> N
     await show(app, callback, await guard.spam_settings_view(app, note="🗑 Список разрешённых ссылок очищен"))
 
 
+@router.callback_query(Guard.filter(F.a == "maxlen"))
+async def ask_max_len(callback: CallbackQuery, state: FSMContext, app: App) -> None:
+    await prompt(
+        app,
+        callback,
+        state,
+        Input.spam_max_len,
+        guard.max_len_prompt_text(app),
+        cancel=Guard(a="spam_set"),
+        extra=[[btn("♾ Без ограничения", Guard(a="maxlen_off"))]],
+    )
+
+
+@router.message(Input.spam_max_len, F.text)
+async def on_max_len(message: Message, state: FSMContext, app: App) -> None:
+    text = message.text.strip()
+    low, high = guard.MAX_LEN_RANGE
+    value = int(text) if text.isdigit() else -1
+    if value != 0 and not low <= value <= high:
+        await message.reply(f"⚠️ Нужно число от {low} до {high} (например, <code>1000</code>) или <code>0</code>.")
+        return
+    await app.settings.set(app.repo, "spam_max_len", str(value))
+    await finish_input(app, message, state)
+    note = f"📏 Длина сообщения: {guard.max_len_label(app)}"
+    await show(app, message, await guard.spam_settings_view(app, note=note))
+
+
+@router.callback_query(Guard.filter(F.a == "maxlen_off"))
+async def max_len_off(callback: CallbackQuery, state: FSMContext, app: App) -> None:
+    await state.clear()
+    await app.settings.set(app.repo, "spam_max_len", "0")
+    await show(app, callback, await guard.spam_settings_view(app, note="📏 Длина сообщения: без ограничения"))
+
+
 @router.callback_query(Guard.filter(F.a == "sub"))
 async def open_sub_settings(callback: CallbackQuery, app: App) -> None:
     await show(app, callback, await guard.sub_settings_view(app))

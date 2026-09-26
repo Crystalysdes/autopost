@@ -7,15 +7,23 @@ import contextlib
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, ChatJoinRequest, Message
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
+from bot.services import group_commands
 from bot.ui.callbacks import SubCheck
 
 router = Router(name="moderation")
 router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 router.edited_message.filter(F.chat.type.in_({"group", "supergroup"}))
+
+
+@router.message(Command(*group_commands.COMMANDS, ignore_case=True))
+async def on_admin_command(message: Message, command: CommandObject, app: App) -> None:
+    """/ban, /mute, /del и другие — ответом на сообщение (bot/services/group_commands.py)."""
+    await group_commands.handle(app, message, command)
 
 
 @router.message()

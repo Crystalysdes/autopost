@@ -66,7 +66,21 @@ async def make_v1_database(path) -> dict[str, int]:
         ids = {"draft": draft.id, "running": running.id, "stopped": stopped.id, "a": chat_a.id, "b": chat_b.id}
     async with db.engine.begin() as conn:
         await conn.exec_driver_sql("DROP TABLE campaign_chats")
+        await conn.exec_driver_sql("DROP TABLE moderation_log")
         await conn.exec_driver_sql("ALTER TABLE campaigns DROP COLUMN kind")
+        # Колонки защиты чатов появились позже — в старой базе их нет
+        for column in (
+            "can_delete",
+            "can_invite",
+            "can_restrict",
+            "invite_link",
+            "spam_filter",
+            "sub_mode",
+            "sub_channels",
+            "auto_approve",
+            "trusted",
+        ):
+            await conn.exec_driver_sql(f"ALTER TABLE chats DROP COLUMN {column}")
         await conn.exec_driver_sql("DELETE FROM settings WHERE key = 'schema_version'")
     await db.close()
     return ids
@@ -100,6 +114,8 @@ async def test_v1_database_is_migrated(tmp_path):
         chat = await repo.get_chat(ids["a"])
         assert chat.auto_approve is None and chat.spam_filter is None and chat.sub_mode is None
         assert chat.trusted is None  # скрытых админов у чата нет
+        assert chat.can_restrict is None and chat.can_invite is None  # права узнаются при первой проверке
+        assert await repo.moderation_counts(0) == (0, 0)  # журнал защиты создан заново
     finally:
         await db.close()
 

@@ -21,7 +21,8 @@ MAX_TRUSTED_BUTTONS = 40  # кнопок «❌» на экране скрыты�
 MAX_TARGET_GROUPS = 40  # групп на экране «Куда добавить?»
 LOG_LIMIT = 10
 # Порядок переключателей на экране (в callback — имя правила)
-UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service")
+UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service", "length")
+MAX_LEN_RANGE = (10, 4096)  # допустимый лимит длины сообщения
 SUB_MODES = {0: None, 1: "own", 2: "off"}
 
 
@@ -233,6 +234,7 @@ async def spam_settings_view(app: App, note: str | None = None) -> Screen:
         f"🚫 Стоп-слова: {len(words) if words is not None else len(spam.DEFAULT_STOP_WORDS)}"
         + (" (свой список)" if words is not None else " (стандартный список)"),
         "✅ Разрешённые ссылки: " + (t.esc(", ".join(allow[:10]), 300) if allow else "нет"),
+        "📏 Длина сообщения: " + max_len_label(app),
         "",
         await _counts_line(app),
     ]
@@ -244,9 +246,28 @@ async def spam_settings_view(app: App, note: str | None = None) -> Screen:
             btn("⏸ Выключить во всех", Guard(a="spam_all", v=0), RED),
         ],
         [btn("🚫 Стоп-слова", Guard(a="words")), btn("✅ Разрешённые ссылки", Guard(a="allow"))],
+        [btn("📏 Длина сообщений", Guard(a="maxlen"))],
         [btn("« Настройки", Nav(to="settings"))],
     ]
     return "\n".join(lines), markup(*rows)
+
+
+def max_len_label(app: App) -> str:
+    limit = app.settings.spam_max_len
+    return f"до {limit} символов" if limit else "без ограничения"
+
+
+def max_len_prompt_text(app: App) -> str:
+    low, high = MAX_LEN_RANGE
+    return (
+        "<b>📏 Максимальная длина сообщения</b>\n\n"
+        "Сообщения длиннее антиспам молча удалит — так пропадают длинные рекламные простыни. Считается весь "
+        "текст: сообщение или подпись к медиа, опрос.\n\n"
+        f"Пришлите число символов от {low} до {high}, например <code>1000</code>. "
+        "<code>0</code> — без ограничения.\n\n"
+        f"Сейчас: <b>{max_len_label(app)}</b>. В отдельном чате правило можно выключить: «🛡 Защита» → "
+        f"«{spam.RULE_TITLES['length']}»."
+    )
 
 
 async def sub_settings_view(app: App, note: str | None = None) -> Screen:

@@ -231,3 +231,20 @@ def test_service_messages():
     pinned = msg(pinned_message={"message_id": 1, "date": 0, "chat": CHAT})
     assert not is_join_leave(pinned) and not has_user_content(pinned)
     assert has_user_content(msg("текст"))
+
+
+# ---------------------------------------------------------------------------- длина
+
+
+def test_long_messages_over_limit():
+    def by_length(message: Message, max_len: int, rules: SpamRules | None = None) -> str | None:
+        return detect(message, rules or SpamRules(), stop_words=WORDS, allow=ALLOW, max_len=max_len).reason
+
+    long_text = "Очень длинное сообщение. " * 10  # 250 символов
+    assert by_length(msg(long_text), 200) == "length"
+    assert by_length(msg(long_text), 250) is None  # ровно лимит — можно
+    assert by_length(msg(long_text), 0) is None  # 0 — без ограничения
+    assert by_length(msg(long_text), 200, SpamRules(length=False)) is None  # правило выключено в чате
+    photo = [{"file_id": "p", "file_unique_id": "u", "width": 10, "height": 10}]
+    assert by_length(msg(photo=photo, caption=long_text), 200) == "length"  # подпись тоже считается
+    assert by_length(msg("Коротко"), 200) is None

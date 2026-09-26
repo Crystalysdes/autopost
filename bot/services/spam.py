@@ -17,13 +17,14 @@ from urllib.parse import urlsplit
 from aiogram.types import Message, MessageEntity
 
 # Порядок важен: причина удаления — первое сработавшее правило
-RULES = ("forwards", "channels", "bots", "links", "contacts", "words", "names", "service")
+RULES = ("forwards", "channels", "bots", "links", "contacts", "words", "length", "names", "service")
 RULE_TITLES = {
     "links": "🔗 Ссылки",
     "bots": "🤖 Боты и каналы",
     "forwards": "↪️ Пересылки",
     "channels": "📢 От имени каналов",
     "words": "🚫 Стоп-слова",
+    "length": "📏 Длинные сообщения",
     "contacts": "📇 Контакты и гео",
     "names": "👤 Реклама в имени",
     "service": "🚪 Вход и выход",
@@ -108,6 +109,7 @@ class SpamRules:
     forwards: bool = True
     channels: bool = True
     words: bool = True
+    length: bool = True  # длиннее лимита из настроек антиспама (если он задан)
     contacts: bool = True
     names: bool = True
     service: bool = True
@@ -273,8 +275,10 @@ def detect(
     *,
     stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]],
     allow: Allowlist,
+    max_len: int = 0,
 ) -> Verdict:
-    """Спам ли это. Служебные сообщения (вход/выход) и исключения (админы и т. п.) решает модератор."""
+    """Спам ли это. Служебные сообщения (вход/выход) и исключения (админы и т. п.) решает модератор.
+    max_len — сколько символов текста разрешено (0 — без ограничения)."""
     if not rules.on:
         return Verdict()
     text = message.text or message.caption or ""
@@ -338,6 +342,9 @@ def detect(
 
     if rules.words and any(has_stop_word(chunk, stop_words) for chunk in texts):
         return Verdict("words", mentions)
+
+    if rules.length and max_len > 0 and sum(len(chunk) for chunk in texts) > max_len:
+        return Verdict("length", mentions)
 
     if rules.names and message.from_user and not message.sender_chat:
         name = message.from_user.full_name

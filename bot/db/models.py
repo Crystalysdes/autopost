@@ -40,6 +40,7 @@ class Chat(Base):
     can_pin: Mapped[bool] = mapped_column(default=False)
     can_delete: Mapped[bool | None] = mapped_column(default=None)  # удалять чужие сообщения (для защиты)
     can_invite: Mapped[bool | None] = mapped_column(default=None)  # создавать ссылки-приглашения
+    can_restrict: Mapped[bool | None] = mapped_column(default=None)  # банить и мутить (команды в группах)
     invite_link: Mapped[str | None] = mapped_column(String(128), default=None)  # закрытый канал: ссылка
     # Защита группы. Антиспам: None — включён со всеми правилами, иначе {"on": bool, "<правило>": bool}.
     spam_filter: Mapped[dict[str, bool] | None] = mapped_column(JSON, default=None)

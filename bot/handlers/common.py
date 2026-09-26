@@ -9,7 +9,14 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, CallbackQuery, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    CallbackQuery,
+    Message,
+)
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
@@ -32,6 +39,16 @@ COMMANDS = [
     BotCommand(command="help", description="Помощь"),
     BotCommand(command="cancel", description="Отменить ввод"),
 ]
+# Меню в группах — только для их админов (bot/services/group_commands.py)
+GROUP_COMMANDS = [
+    BotCommand(command="del", description="Удалить сообщение (ответом на него)"),
+    BotCommand(command="mute", description="Замутить: /mute, /mute 1h, /mute 1day (ответом)"),
+    BotCommand(command="delmute", description="Удалить сообщение и замутить автора"),
+    BotCommand(command="ban", description="Забанить: /ban или /ban 1day (ответом)"),
+    BotCommand(command="delban", description="Удалить сообщение и забанить автора"),
+    BotCommand(command="unmute", description="Снять мут (ответом или /unmute ID)"),
+    BotCommand(command="unban", description="Разбанить (ответом или /unban ID)"),
+]
 
 
 async def setup_commands(bot: Bot, admin_ids: Iterable[int]) -> set[int]:
@@ -48,6 +65,10 @@ async def setup_commands(bot: Bot, admin_ids: Iterable[int]) -> set[int]:
         await bot.delete_my_commands(scope=BotCommandScopeDefault())
     except TelegramAPIError as error:
         logger.info("Не удалось очистить общее меню команд: %s", error)
+    try:
+        await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllChatAdministrators())
+    except TelegramAPIError as error:
+        logger.info("Не удалось установить команды для админов групп: %s", error)
     return ready
 
 

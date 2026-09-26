@@ -40,6 +40,7 @@ async def apply_member(app: App, *, chat: Any, member: Any, actor_id: int | None
         can_pin=rights.can_pin,
         can_delete=rights.can_delete,
         can_invite=rights.can_invite,
+        can_restrict=rights.can_restrict,
         actor_id=actor_id,
         admin_ids=app.admin_ids,
     )

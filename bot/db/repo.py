@@ -218,6 +218,7 @@ class Repo:
         admin_ids: Collection[int],
         can_delete: bool = False,
         can_invite: bool = False,
+        can_restrict: bool = False,
     ) -> ChatChange:
         """Бот вышел из чата — рассылки не трогаем: этот чат просто пропускается при публикации
         и возвращается в работу, когда бота добавят снова."""
@@ -241,6 +242,7 @@ class Repo:
             chat.can_pin = can_pin
             chat.can_delete = can_delete
             chat.can_invite = can_invite
+            chat.can_restrict = can_restrict
             chat.status = status
             if prev in (None, "left") and in_chat:
                 chat.added_by = actor_id

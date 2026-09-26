@@ -20,6 +20,7 @@ class Input(StatesGroup):
     spam_words = State()
     spam_allow = State()
     trusted = State()  # скрытые админы: пересылка, @username или ID
+    spam_max_len = State()  # максимальная длина сообщения
 
 
 class Picker(StatesGroup):

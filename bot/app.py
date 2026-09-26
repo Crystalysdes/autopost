@@ -37,6 +37,7 @@ class AppSettings:
         # Защита групп (списки хранятся в settings как JSON)
         self.spam_words: list[str] | None = None  # None — стандартный список из bot/services/spam.py
         self.spam_allow: list[str] = []  # разрешённые ссылки: домены и @имена
+        self.spam_max_len = 0  # длиннее — спам (правило «📏 Длинные сообщения»); 0 — без ограничения
         self.sub_channels: list[int] = []  # общие каналы обязательной подписки (id записей чатов)
         # Автоприём заявок в чатах, где он не выбран отдельно (в том числе в новых)
         self.join_auto = True
@@ -60,6 +61,8 @@ class AppSettings:
             self.notify_errors = value == "1"
         elif key == "join_auto":
             self.join_auto = value == "1"
+        elif key == "spam_max_len":
+            self.spam_max_len = int(value) if value.isdigit() else 0
         elif key in ("spam_words", "spam_allow", "sub_channels", "trusted"):
             self._apply_list(key, value)
 

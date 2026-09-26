@@ -14,6 +14,7 @@ class BotRights:
     can_pin: bool
     can_delete: bool = False  # удалять сообщения участников — нужно защите группы
     can_invite: bool = False  # создавать ссылки-приглашения — для подписки на закрытый канал
+    can_restrict: bool = False  # банить и ограничивать участников — команды /ban и /mute в группах
 
 
 def enum_text(value: Any) -> str:
@@ -27,6 +28,7 @@ def rights_from_member(chat_type: str, member: Any) -> BotRights:
     if status in ("administrator", "creator"):
         can_delete = bool(getattr(member, "can_delete_messages", False))
         can_invite = bool(getattr(member, "can_invite_users", False))
+        can_restrict = bool(getattr(member, "can_restrict_members", False))
         if chat_type == "channel":
             # В канале закрепление требует права редактировать сообщения
             return BotRights(
@@ -36,6 +38,7 @@ def rights_from_member(chat_type: str, member: Any) -> BotRights:
                 can_pin=bool(getattr(member, "can_edit_messages", False)),
                 can_delete=can_delete,
                 can_invite=can_invite,
+                can_restrict=can_restrict,
             )
         return BotRights(
             in_chat=True,
@@ -44,6 +47,7 @@ def rights_from_member(chat_type: str, member: Any) -> BotRights:
             can_pin=bool(getattr(member, "can_pin_messages", False)),
             can_delete=can_delete,
             can_invite=can_invite,
+            can_restrict=can_restrict,
         )
     if status == "member":
         return BotRights(in_chat=True, is_admin=False, can_post=chat_type != "channel", can_pin=False)

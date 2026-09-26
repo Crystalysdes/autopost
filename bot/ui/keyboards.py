@@ -121,8 +121,11 @@ def _rights(**enabled: bool) -> ChatAdministratorRights:
 def add_chat_reply() -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: нативный выбор чата (Telegram сам добавит бота админом с нужными правами)
     и выбор людей в скрытые админы."""
-    # Право приглашать нужно, чтобы Telegram присылал боту заявки на вступление (автоприём)
-    group_rights = _rights(can_delete_messages=True, can_pin_messages=True, can_invite_users=True)
+    # Право приглашать нужно, чтобы Telegram присылал боту заявки на вступление (автоприём),
+    # блокировка — для команд /ban и /mute
+    group_rights = _rights(
+        can_delete_messages=True, can_pin_messages=True, can_invite_users=True, can_restrict_members=True
+    )
     # В канале это право ещё и для личных ссылок в подсказке об обязательной подписке
     channel_rights = _rights(
         can_post_messages=True, can_edit_messages=True, can_delete_messages=True, can_invite_users=True
@@ -174,7 +177,7 @@ def add_chat_reply() -> ReplyKeyboardMarkup:
 
 
 def add_group_link(bot_username: str) -> str:
-    return f"https://t.me/{bot_username}?startgroup=autopost&admin=delete_messages+pin_messages+invite_users"
+    return f"https://t.me/{bot_username}?startgroup=autopost&admin=delete_messages+pin_messages+invite_users+restrict_members"
 
 
 def add_channel_link(bot_username: str) -> str:
