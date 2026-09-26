@@ -61,8 +61,11 @@ async def test_chat_screen_has_protection_only_for_groups(feed, app, session, mo
     channel = await add_chat(feed, app, -1004000000999, chat_type="channel")
     await feed(press(Nav(to="chat", id=group.id)))
     assert Guard(a="chat", id=group.id).pack() in button_data(last_markup(session))
+    assert Guard(a="jchat", id=group.id, v=0).pack() in button_data(last_markup(session))
     await feed(press(Nav(to="chat", id=channel.id)))
-    assert not any(data.startswith("m:") for data in button_data(last_markup(session)))
+    buttons = button_data(last_markup(session))
+    assert Guard(a="chat", id=channel.id).pack() not in buttons  # защита — только в группах
+    assert Guard(a="jchat", id=channel.id, v=0).pack() in buttons  # автоприём — и в каналах
 
 
 async def test_toggles_change_what_is_deleted(feed, app, session, moderator):

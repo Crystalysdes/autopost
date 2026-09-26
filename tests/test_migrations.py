@@ -96,6 +96,9 @@ async def test_v1_database_is_migrated(tmp_path):
         assert link.sent_count == 3 and link.fail_count == 2 and link.last_error == "boom" and not link.paused
         assert [c.id for c in await repo.list_campaigns(ids["b"])] == [ids["stopped"]]
         assert len(await repo.list_posts(running.id)) == 1
+        # Колонки новых функций дописаны сами: автоприём заявок — по общей настройке (включён)
+        chat = await repo.get_chat(ids["a"])
+        assert chat.auto_approve is None and chat.spam_filter is None and chat.sub_mode is None
     finally:
         await db.close()
 

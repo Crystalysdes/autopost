@@ -18,6 +18,7 @@ from bot.services import schedule_utils as su
 from bot.services.buttons import buttons_to_html, count_buttons, has_icons
 from bot.services.campaigns import target_problem
 from bot.services.content import custom_emoji_count, post_text, post_title, supports_buttons
+from bot.services.moderation import auto_approve_on
 from bot.services.scheduler import predict_runs, spec_of
 from bot.ui import texts as t
 from bot.ui.callbacks import (
@@ -137,6 +138,9 @@ async def main_menu(app: App) -> Screen:
     spam_today, sub_today = await app.repo.moderation_counts(t.day_start_ts(tz, now))
     if spam_today or sub_today:
         lines.append(f"🛡 Сегодня удалено: спам {spam_today} · без подписки {sub_today}")
+    joined_today = await app.repo.join_counts(t.day_start_ts(tz, now))
+    if joined_today:
+        lines.append(f"🚪 Сегодня принято заявок: {joined_today}")
     if upcoming and not app.settings.paused_all:
         campaign = upcoming[0]
         lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · «{t.esc(campaign.name, 30)}»")
@@ -235,11 +239,27 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
         post_mark = "✅" if chat.can_post else "❌"
         pin_mark = "✅" if chat.can_pin else "❌"
         delete_mark = "✅" if chat.can_delete else "❌"
-        lines.append(f"Права бота: {post_mark} публикация · {pin_mark} закрепление · {delete_mark} удаление")
+        invite_mark = "✅" if chat.can_invite else "❌"
+        lines.append(
+            f"Права бота: {post_mark} публикация · {pin_mark} закрепление · {delete_mark} удаление · "
+            f"{invite_mark} приглашения"
+        )
         if not chat.can_post:
             lines.append("⚠️ Бот не может публиковать здесь — выдайте ему право «Публикация сообщений».")
         if chat.type != "channel" and chat.can_delete is False:
             lines.append("⚠️ Без права «Удаление сообщений» защита чата (антиспам, подписка) не работает.")
+    join_on = auto_approve_on(chat, app.settings.join_auto)
+    if chat.status == "active":
+        if join_on:
+            joined = await app.repo.join_counts(t.day_start_ts(app.settings.tz, _now(app)), chat.id)
+            lines.append("🚪 Автоприём заявок: ✅ включён" + (f" · сегодня принято {joined}" if joined else ""))
+            if chat.can_invite is False:
+                lines.append(
+                    f"⚠️ Без права {t.invite_right(chat.type)} бот не получает заявки — выдайте его в настройках "
+                    "администраторов."
+                )
+        else:
+            lines.append("🚪 Автоприём заявок: ⏸ выключен — заявки принимаете вы.")
     lines.append("")
     if campaigns:
         lines.append(f"📬 Рассылок с этим чатом: <b>{len(campaigns)}</b>")
@@ -290,6 +310,15 @@ async def chat_view(app: App, chat_id: int) -> Screen | None:
         rows.append([btn(f"▶️ Запустить остановленные ({stopped})", ChatAct(a="resume", id=chat.id))])
     if chat.type != "channel":
         rows.append([btn(protection_label(chat, app.settings.sub_channels), Guard(a="chat", id=chat.id), BLUE)])
+    if chat.status == "active":
+        rows.append(
+            [
+                btn(
+                    "🚪 Автоприём заявок: ✅ вкл" if join_on else "🚪 Автоприём заявок: ⏸ выкл",
+                    Guard(a="jchat", id=chat.id, v=int(not join_on)),
+                )
+            ]
+        )
     rows.append(
         [
             btn("🔄 Обновить права", ChatAct(a="refresh", id=chat.id)),
@@ -1251,12 +1280,15 @@ async def settings_view(app: App, note: str | None = None) -> Screen:
     tz, now = app.settings.tz, _now(app)
     local_now = datetime.fromtimestamp(now, tz).strftime("%H:%M")
     paused = app.settings.paused_all
+    chats = await app.repo.list_chats(statuses=("active",))
+    joining = sum(1 for chat in chats if auto_approve_on(chat, app.settings.join_auto))
     lines = [
         "<b>⚙️ Настройки</b>",
         "",
         f"🌍 Часовой пояс: <b>{t.tz_label(app.settings.timezone, tz, now)}</b>, сейчас {local_now}",
         "⏯ Рассылки: " + ("⏸ <b>все на паузе</b>" if paused else "▶️ работают"),
         "🔔 Уведомления об ошибках: " + ("вкл" if app.settings.notify_errors else "выкл"),
+        f"🚪 Автоприём заявок: включён в {joining} из {len(chats)} чатов",
         "",
         "💾 Резервная копия — бот пришлёт файл базы данных со всеми чатами, рассылками и черновиками.",
     ]
@@ -1265,6 +1297,7 @@ async def settings_view(app: App, note: str | None = None) -> Screen:
     rows = [
         [btn("🌍 Часовой пояс", Nav(to="tz"))],
         [btn("🛡 Антиспам", Guard(a="spam_set")), btn("🔒 Обязательная подписка", Guard(a="sub"))],
+        [btn("🚪 Автоприём заявок", Guard(a="joins"))],
         [
             btn("▶️ Возобновить все рассылки", SetAct(a="pause", v=0), GREEN)
             if paused
@@ -1339,7 +1372,10 @@ def help_view() -> Screen:
         "подписчики выбранных каналов: остальным бот показывает личные ссылки на каналы и кнопку "
         "«✅ Проверить подписку». Правила чата — «🛡 Защита» на экране чата. Боту нужно право "
         f"«Удаление сообщений», а в каналах для подписки он должен быть админом с правом {t.INVITE_RIGHT}.\n\n"
-        "<b>5. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. «📤 Применить к чатам» "
+        "<b>5. Автоприём заявок.</b> Бот сам принимает заявки на вступление в группы и каналы — везде, где они "
+        "есть. Выключить можно галочками в «⚙️ Настройки → 🚪 Автоприём заявок» или на экране чата. Боту нужно "
+        "право приглашать: без него Telegram не присылает ему заявки.\n\n"
+        "<b>6. Черновики.</b> «💾 В черновики» сохраняет посты, расписание и опции. «📤 Применить к чатам» "
         "запускает черновик в нужных чатах. Изменили черновик — «🔄 Обновить рассылки».\n\n"
         "<b>Кнопки под постом</b> (одна строка — один ряд):\n"
         "<code>Текст - https://ссылка</code>\n"

@@ -264,3 +264,40 @@ async def reset_sub_modes(callback: CallbackQuery, app: App, callback_answer: Ca
     _forget(app)
     callback_answer.text = f"↩️ Перешли на общие каналы: {count}"
     await show(app, callback, await guard.sub_settings_view(app))
+
+
+# ---------------------------------------------------------------- автоприём заявок
+
+
+@router.callback_query(Guard.filter(F.a == "joins"))
+async def open_joins(callback: CallbackQuery, app: App) -> None:
+    await show(app, callback, await guard.joins_view(app))
+
+
+@router.callback_query(Guard.filter(F.a.in_({"jn", "jchat"})))
+async def toggle_join(callback: CallbackQuery, callback_data: Guard, app: App, callback_answer: CallbackAnswer) -> None:
+    """jn — галочка на экране автоприёма, jchat — переключатель на экране чата."""
+    chat = await _chat_or_gone(callback, callback_data, app, callback_answer)
+    if chat is None:
+        return
+    on = bool(callback_data.v)
+    await app.repo.update_chat(chat.id, auto_approve=on)
+    if on and chat.can_invite is False:
+        callback_answer.text = f"⚠️ Нет права {t.invite_right(chat.type)} — без него заявки не приходят боту"
+        callback_answer.show_alert = True
+    else:
+        callback_answer.text = "🚪 Автоприём включён" if on else "⏸ Автоприём выключен — заявки принимаете вы"
+    if callback_data.a == "jchat":
+        await show(app, callback, await screens.chat_view(app, chat.id) or await screens.chats_list(app))
+    else:
+        await show(app, callback, await guard.joins_view(app))
+
+
+@router.callback_query(Guard.filter(F.a == "jall"))
+async def join_everywhere(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
+    """Общая настройка — для всех чатов и для новых; выбранное отдельно для чатов сбрасывается."""
+    on = bool(callback_data.v)
+    await app.settings.set(app.repo, "join_auto", on)
+    await app.repo.reset_auto_approve()
+    note = "✅ Автоприём включён во всех чатах и каналах" if on else "⏸ Автоприём выключен во всех чатах и каналах"
+    await show(app, callback, await guard.joins_view(app, note))

@@ -37,6 +37,8 @@ class AppSettings:
         self.spam_words: list[str] | None = None  # None — стандартный список из bot/services/spam.py
         self.spam_allow: list[str] = []  # разрешённые ссылки: домены и @имена
         self.sub_channels: list[int] = []  # общие каналы обязательной подписки (id записей чатов)
+        # Автоприём заявок в чатах, где он не выбран отдельно (в том числе в новых)
+        self.join_auto = True
 
     @property
     def tz(self) -> ZoneInfo:
@@ -53,6 +55,8 @@ class AppSettings:
             self.paused_all = value == "1"
         elif key == "notify_errors":
             self.notify_errors = value == "1"
+        elif key == "join_auto":
+            self.join_auto = value == "1"
         elif key in ("spam_words", "spam_allow", "sub_channels"):
             self._apply_list(key, value)
 

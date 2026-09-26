@@ -1,4 +1,4 @@
-"""Защита групп: антиспам и обязательная подписка на каналы.
+"""Защита чатов: антиспам, обязательная подписка на каналы и автоприём заявок на вступление.
 
 Сообщения проверяются в памяти. К Telegram бот обращается, только когда без этого не решить
 (кто админ чата, кто скрывается за @ником, подписан ли человек), и запоминает ответы на время.
@@ -9,6 +9,8 @@
 3. антиспам: если сообщение похоже на спам и автор не админ чата — молча удалить;
 4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
    с новыми личными ссылками-приглашениями на каналы.
+
+Заявки на вступление в группы и каналы бот принимает сам, если там включён автоприём.
 """
 
 from __future__ import annotations
@@ -29,10 +31,11 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.types import Message, User
+from aiogram.types import ChatJoinRequest, Message, User
 
 from bot.app import NO_PREVIEW, App
 from bot.db.models import Chat
+from bot.db.repo import JOIN_REASON
 from bot.services import chats as chat_service
 from bot.services import spam
 from bot.services.errors import humanize
@@ -63,6 +66,10 @@ BACKLOG_SECONDS = 120  # сообщения старше (пришли, пока
 PROBLEM_INTERVAL = 24 * 3600  # одинаковые предупреждения админам — не чаще раза в сутки
 MAX_MENTION_CHECKS = 5  # @ников на одно сообщение, которые проверяем через Telegram
 RETRY_AFTER_LIMIT = 30
+JOIN_ATTEMPTS = 3  # заявку при лимите Telegram пробуем принять несколько раз
+JOIN_RETRY_LIMIT = 300  # и ждём ради этого не дольше (каждая заявка обрабатывается отдельно)
+# Заявку уже рассмотрели (приняли вручную, человек отозвал её или уже в чате) — принимать нечего
+JOIN_ALREADY_DONE = ("hide_requester_missing", "user_already_participant", "already a member")
 
 _MISSING = object()
 
@@ -483,6 +490,46 @@ class Moderator:
             with contextlib.suppress(TelegramAPIError):
                 await self.app.bot.delete_messages(tg_id, ids)
 
+    # ------------------------------------------------------------------ заявки на вступление
+
+    async def join_request(self, request: ChatJoinRequest) -> None:
+        """Заявка в группу или канал: если там включён автоприём — принять сразу. Иначе заявку рассмотрят
+        админы чата, как обычно."""
+        chat = await self.app.repo.get_chat_by_tg(request.chat.id)
+        if chat is None or chat.status != "active" or not auto_approve_on(chat, self.app.settings.join_auto):
+            return
+        user = request.from_user
+        for attempt in range(1, JOIN_ATTEMPTS + 1):
+            try:
+                await self.app.bot.approve_chat_join_request(chat.tg_id, user.id)
+            except TelegramRetryAfter as error:
+                if attempt < JOIN_ATTEMPTS and error.retry_after <= JOIN_RETRY_LIMIT:
+                    await asyncio.sleep(error.retry_after)
+                    continue
+                logger.warning("Заявка %s в «%s» не принята: лимит Telegram", user.id, chat.title)
+                return
+            except TelegramBadRequest as error:
+                text = error.message.lower()
+                if any(marker in text for marker in JOIN_ALREADY_DONE):
+                    return
+                if "right" in text or "admin_required" in text:
+                    await self._problem(
+                        (chat.tg_id, "join"),
+                        texts.no_join_right_text(chat.title, chat.type),
+                        keyboards.open_chat(chat.id),
+                    )
+                else:
+                    logger.info("Заявка %s в «%s» не принята: %s", user.id, chat.title, error.message)
+                return
+            except TelegramAPIError as error:
+                logger.info("Заявка %s в «%s» не принята: %s", user.id, chat.title, error)
+                return
+            break
+        logger.debug("Автоприём: %s принят в «%s»", user.full_name, chat.title)  # итоги — на экранах бота
+        await self.app.repo.log_moderation(
+            chat.id, user_id=user.id, user_name=user.full_name, reason=JOIN_REASON, snippet=None, now=int(self.wall())
+        )
+
     # ------------------------------------------------------------------ удаление
 
     async def _delete(self, info: ChatInfo, ids: list[int]) -> bool:
@@ -559,6 +606,11 @@ def invite_name(full_name: str, user_id: int) -> str:
         room -= size
     name = name.strip()
     return name + suffix if name else str(user_id)
+
+
+def auto_approve_on(chat: Chat, default: bool) -> bool:
+    """Принимает ли бот заявки в этот чат: выбранное для чата, иначе общая настройка."""
+    return default if chat.auto_approve is None else chat.auto_approve
 
 
 def required_channels(chat: Chat, common: Sequence[int]) -> tuple[int, ...]:

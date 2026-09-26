@@ -1,4 +1,4 @@
-"""Экраны защиты групп: антиспам и обязательная подписка."""
+"""Экраны защиты чатов: антиспам, обязательная подписка и автоприём заявок."""
 
 from __future__ import annotations
 
@@ -9,13 +9,14 @@ from aiogram.types import InlineKeyboardButton
 from bot.app import App
 from bot.db.models import Chat, now_ts
 from bot.services import spam
-from bot.services.moderation import GROUP_TYPES, required_channels
+from bot.services.moderation import GROUP_TYPES, auto_approve_on, required_channels
 from bot.ui import texts as t
 from bot.ui.callbacks import Guard, Nav
 from bot.ui.keyboards import GREEN, RED, btn, markup
 from bot.ui.render import Screen
 
 MAX_CHANNELS = 40
+MAX_JOIN_CHATS = 40  # галочек на экране автоприёма; остальные чаты — на их экранах
 LOG_LIMIT = 10
 # Порядок переключателей на экране (в callback — имя правила)
 UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service")
@@ -269,6 +270,58 @@ async def sub_settings_view(app: App, note: str | None = None) -> Screen:
     rows = [[btn(f"📢 Общие каналы ({len(common)})", Guard(a="ch", id=0), GREEN)]]
     if own or off:
         rows.append([btn("↩️ Все группы — на общие каналы", Guard(a="sub_reset"))])
+    rows.append([btn("« Настройки", Nav(to="settings"))])
+    return "\n".join(lines), markup(*rows)
+
+
+async def joins_view(app: App, note: str | None = None) -> Screen:
+    """Автоприём заявок на вступление: галочки чатов и «во всех»."""
+    chats = await app.repo.list_chats(statuses=("active",))
+    default = app.settings.join_auto
+    enabled = [c for c in chats if auto_approve_on(c, default)]
+    no_right = [c for c in enabled if c.can_invite is False]
+    now = _now(app)
+    today = await app.repo.join_counts(t.day_start_ts(app.settings.tz, now))
+    week = await app.repo.join_counts(now - 7 * 24 * 3600)
+    lines = [
+        "<b>🚪 Автоприём заявок</b>",
+        "",
+        "Бот сам принимает заявки на вступление в отмеченные группы и каналы. Заявки бывают, где включено "
+        "«Одобрение новых участников» или раздаются ссылки с заявками, — в остальных чатах люди вступают сразу.",
+        "",
+        f"Telegram присылает боту заявки, только если у него есть право приглашать: в группе — "
+        f"{t.GROUP_INVITE_RIGHT}, в канале — {t.INVITE_RIGHT}.",
+        "",
+        f"Включён: <b>{len(enabled)}</b> из {len(chats)}",
+        "Новые чаты: " + ("✅ автоприём включается сам" if default else "⏸ без автоприёма"),
+        f"📊 Принято сегодня: {today} · за 7 дней: {week}",
+    ]
+    if no_right:
+        names = t.names_label([c.title for c in no_right], 5, 30)
+        lines += ["", f"⚠️ Нет права приглашать — заявки не приходят боту: {names}"]
+    if len(chats) > MAX_JOIN_CHATS:
+        lines += ["", f"Показаны первые {MAX_JOIN_CHATS} — остальные включаются на экране чата."]
+    if note:
+        lines += ["", note]
+    rows: list[list[InlineKeyboardButton] | None] = []
+    for chat in chats[:MAX_JOIN_CHATS]:
+        on = auto_approve_on(chat, default)
+        icon = t.CHAT_ICONS.get(chat.type, "💬")
+        warn = " ⚠️" if on and chat.can_invite is False else ""
+        rows.append(
+            [
+                btn(
+                    f"{'☑️' if on else '⬜'} {icon} {t.cut(chat.title, 34)}{warn}",
+                    Guard(a="jn", id=chat.id, v=int(not on)),
+                )
+            ]
+        )
+    rows.append(
+        [
+            btn("✅ Включить во всех", Guard(a="jall", v=1), GREEN),
+            btn("⏸ Выключить во всех", Guard(a="jall", v=0), RED),
+        ]
+    )
     rows.append([btn("« Настройки", Nav(to="settings"))])
     return "\n".join(lines), markup(*rows)
 

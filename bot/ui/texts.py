@@ -10,8 +10,14 @@ from zoneinfo import ZoneInfo
 WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 CHAT_TYPES = {"channel": "канал", "supergroup": "супергруппа", "group": "группа"}
 CHAT_ICONS = {"channel": "📢", "supergroup": "👥", "group": "👥"}
-# Право бота в канале на ссылки-приглашения: в разных версиях Telegram оно называется по-разному
+# Право бота приглашать (ссылки-приглашения, заявки на вступление): в разных версиях Telegram оно
+# называется по-разному, в канале и в группе — тоже
 INVITE_RIGHT = "«Добавление подписчиков» («Пригласительные ссылки»)"
+GROUP_INVITE_RIGHT = "«Добавление участников» («Пригласительные ссылки»)"
+
+
+def invite_right(chat_type: str) -> str:
+    return INVITE_RIGHT if chat_type == "channel" else GROUP_INVITE_RIGHT
 
 
 def esc(value: object, limit: int | None = None) -> str:
@@ -245,6 +251,13 @@ def no_delete_right_text(title: str) -> str:
     return (
         f"🛡 Защита в «<b>{esc(title)}</b>» не работает: у бота нет права «Удаление сообщений».\n\n"
         "Выдайте его в настройках администраторов чата — спам и сообщения без подписки снова начнут удаляться."
+    )
+
+
+def no_join_right_text(title: str, chat_type: str) -> str:
+    return (
+        f"🚪 Автоприём заявок в «<b>{esc(title)}</b>» не работает: Telegram не даёт боту принимать заявки.\n\n"
+        f"Выдайте боту право {invite_right(chat_type)} в настройках администраторов — пока заявки ждут вас."
     )
 
 

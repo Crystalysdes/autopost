@@ -1,4 +1,5 @@
-"""Сообщения участников групп: антиспам и обязательная подписка (см. bot/services/moderation.py)."""
+"""Участники групп и каналов: антиспам, обязательная подписка и автоприём заявок
+(см. bot/services/moderation.py)."""
 
 from __future__ import annotations
 
@@ -6,7 +7,7 @@ import contextlib
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatJoinRequest, Message
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
@@ -28,6 +29,13 @@ async def on_group_edit(message: Message, app: App) -> None:
     """Спамеры пишут безобидный текст, а ссылку добавляют правкой."""
     if app.moderator is not None:
         await app.moderator.handle(message, edited=True)
+
+
+@router.chat_join_request()
+async def on_join_request(request: ChatJoinRequest, app: App) -> None:
+    """Заявка на вступление в группу или канал (приходит, только если у бота есть право приглашать)."""
+    if app.moderator is not None:
+        await app.moderator.join_request(request)
 
 
 @router.callback_query(SubCheck.filter())

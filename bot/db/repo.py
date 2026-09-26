@@ -41,6 +41,7 @@ POST_FIELDS = ("kind", "payload", "buttons", "forward_from", "send_mode")
 NAME_LIMIT = 64
 GROUP_TYPES = ("group", "supergroup")
 MODERATION_KEEP_SECONDS = 14 * 24 * 3600  # журнал удалённого защитой хранится две недели
+JOIN_REASON = "join"  # в том же журнале — заявки на вступление, которые бот принял сам
 
 
 @dataclass
@@ -333,6 +334,13 @@ class Repo:
             await s.commit()
             return int(result.rowcount or 0)
 
+    async def reset_auto_approve(self) -> int:
+        """Все чаты и каналы переходят на общую настройку автоприёма заявок."""
+        async with self.db.session() as s:
+            result = await s.execute(update(Chat).where(Chat.auto_approve.is_not(None)).values(auto_approve=None))
+            await s.commit()
+            return int(result.rowcount or 0)
+
     async def log_moderation(
         self,
         chat_id: int,
@@ -368,14 +376,26 @@ class Repo:
             if chat_id is not None:
                 query = query.where(ModerationLog.chat_id == chat_id)
             counts = {reason: int(count) for reason, count in await s.execute(query.group_by(ModerationLog.reason))}
+        counts.pop(JOIN_REASON, 0)  # принятые заявки — не удаления
         sub = counts.pop("sub", 0)
         return sum(counts.values()), sub
 
+    async def join_counts(self, since_ts: int, chat_id: int | None = None) -> int:
+        """Сколько заявок на вступление бот принял начиная с since_ts."""
+        async with self.db.session() as s:
+            query = select(func.count(ModerationLog.id)).where(
+                ModerationLog.reason == JOIN_REASON, ModerationLog.ts >= since_ts
+            )
+            if chat_id is not None:
+                query = query.where(ModerationLog.chat_id == chat_id)
+            return int(await s.scalar(query) or 0)
+
     async def last_moderation(self, chat_id: int, limit: int = 10) -> list[ModerationLog]:
+        """Последние удалённые сообщения (принятые заявки сюда не входят)."""
         async with self.db.session() as s:
             rows = await s.scalars(
                 select(ModerationLog)
-                .where(ModerationLog.chat_id == chat_id)
+                .where(ModerationLog.chat_id == chat_id, ModerationLog.reason != JOIN_REASON)
                 .order_by(ModerationLog.ts.desc(), ModerationLog.id.desc())
                 .limit(limit)
             )

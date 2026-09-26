@@ -46,6 +46,8 @@ class Chat(Base):
     # Обязательная подписка: None — общие каналы из настроек, "own" — свои (sub_channels), "off" — выключена
     sub_mode: Mapped[str | None] = mapped_column(String(8), default=None)
     sub_channels: Mapped[list[int] | None] = mapped_column(JSON, default=None)
+    # Автоприём заявок на вступление: None — как в общих настройках, True/False — выбрано для этого чата
+    auto_approve: Mapped[bool | None] = mapped_column(default=None)
     added_by: Mapped[int | None] = mapped_column(BigInteger, default=None)
     created_ts: Mapped[int] = mapped_column(default=now_ts)
     updated_ts: Mapped[int] = mapped_column(default=now_ts, onupdate=now_ts)
