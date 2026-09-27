@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import AnswerCallbackQuery, ApproveChatJoinRequest, SendMessage
+from aiogram.methods import AnswerCallbackQuery, ApproveChatJoinRequest, DeclineChatJoinRequest, SendMessage
 from aiogram.types import Chat, ChatJoinRequest, Update, User
 
 from bot.services import moderation as moderation_module
@@ -44,18 +44,23 @@ async def moderator(app, clock):
     await instance.close()
 
 
-def join_request(chat_id: int, user: User = PERSON, chat_type: str = "supergroup") -> Update:
+def join_request(chat_id: int, user: User = PERSON, chat_type: str = "supergroup", bio: str | None = None) -> Update:
     request = ChatJoinRequest(
         chat=Chat(id=chat_id, type=chat_type, title="Чат"),
         from_user=user,
         user_chat_id=user.id,
         date=datetime.now(),
+        bio=bio,
     )
     return Update(update_id=next(_ids), chat_join_request=request)
 
 
 def approved(session) -> list[tuple[int, int]]:
     return [(int(call.chat_id), call.user_id) for call in session.calls(ApproveChatJoinRequest)]
+
+
+def declined(session) -> list[tuple[int, int]]:
+    return [(int(call.chat_id), call.user_id) for call in session.calls(DeclineChatJoinRequest)]
 
 
 def refusal(message: str) -> TelegramBadRequest:
@@ -168,6 +173,55 @@ async def test_missing_right_is_reported_once_a_day(feed, app, session, moderato
     assert await app.repo.join_counts(0) == 0
 
 
+# ------------------------------------------------------------------------ подозрительные заявки
+
+
+SPAMMER = User(id=5100, is_bot=False, first_name="Заработок", last_name="в лс")
+
+
+async def test_suspicious_requests_are_declined(feed, app, session, moderator):
+    group = await add_with_invite(feed, app, GROUP)
+    session.clear()
+    promoter = User(id=5101, is_bot=False, first_name="Анна")
+    await feed(
+        join_request(GROUP, user=SPAMMER),  # реклама в имени
+        join_request(GROUP, user=promoter, bio="Пиши @spam_manager — всё расскажу"),  # в «о себе»
+        join_request(GROUP, user=User(id=5102, is_bot=False, first_name="Катя"), bio="Люблю котов"),
+    )
+    assert declined(session) == [(GROUP, SPAMMER.id), (GROUP, promoter.id)]
+    assert approved(session) == [(GROUP, 5102)]
+    assert await app.repo.join_counts(0) == 1
+    assert await app.repo.join_counts(0, reason="join_no") == 2
+    assert await app.repo.moderation_counts(0) == (0, 0)  # не удалённый спам
+    assert await app.repo.last_moderation(group.id) == []  # и не «Последние удалённые»
+
+    await feed(press(Nav(to="main")))
+    assert "Сегодня принято заявок: 1 · отклонено: 2" in owner_texts(session)[-1]
+
+
+async def test_filter_can_be_switched_off(feed, app, session, moderator):
+    await add_with_invite(feed, app, GROUP)
+    await feed(press(Guard(a="joins")))
+    assert "🤖 Подозрительные заявки: ✅ отклоняются" in owner_texts(session)[-1]
+    await feed(press(Guard(a="jfilter", v=0)))
+    assert app.settings.join_filter is False
+    assert "⏸ не проверяются" in owner_texts(session)[-1]
+    session.clear()
+    await feed(join_request(GROUP, user=SPAMMER))
+    assert approved(session) == [(GROUP, SPAMMER.id)] and declined(session) == []
+
+    await feed(press(Guard(a="jfilter", v=1)))
+    assert (await app.repo.load_settings())["join_filter"] == "1"
+
+
+async def test_without_auto_approve_suspicious_requests_wait_for_admins(feed, app, session, moderator):
+    group = await add_with_invite(feed, app, GROUP)
+    await feed(press(Guard(a="jchat", id=group.id, v=0)))
+    session.clear()
+    await feed(join_request(GROUP, user=SPAMMER))
+    assert approved(session) == [] and declined(session) == []
+
+
 # ------------------------------------------------------------------------ экраны
 
 
@@ -216,7 +270,7 @@ async def test_accepted_requests_are_counted_on_screens(feed, app, session, mode
     assert "✅ приглашения" in owner_texts(session)[-1]
     assert "сегодня принято 1" in owner_texts(session)[-1]
     await feed(press(Guard(a="joins")))
-    assert "Принято сегодня: 1 · за 7 дней: 1" in owner_texts(session)[-1]
+    assert "Сегодня: принято 1, отклонено 0 · за 7 дней: принято 1, отклонено 0" in owner_texts(session)[-1]
 
 
 # ------------------------------------------------------------------------ прочее

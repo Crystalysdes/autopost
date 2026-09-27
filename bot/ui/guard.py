@@ -8,6 +8,7 @@ from aiogram.types import InlineKeyboardButton
 
 from bot.app import App
 from bot.db.models import Chat, now_ts
+from bot.db.repo import JOIN_DECLINED
 from bot.services import spam, trusted
 from bot.services.moderation import GROUP_TYPES, auto_approve_on, required_channels
 from bot.ui import texts as t
@@ -21,7 +22,7 @@ MAX_TRUSTED_BUTTONS = 40  # кнопок «❌» на экране скрыты�
 MAX_TARGET_GROUPS = 40  # групп на экране «Куда добавить?»
 LOG_LIMIT = 10
 # Порядок переключателей на экране (в callback — имя правила)
-UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service", "length")
+UI_RULES = ("links", "bots", "forwards", "channels", "words", "contacts", "names", "service", "length", "addbots")
 MAX_LEN_RANGE = (10, 4096)  # допустимый лимит длины сообщения
 SUB_MODES = {0: None, 1: "own", 2: "off"}
 
@@ -310,8 +311,12 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
     enabled = [c for c in chats if auto_approve_on(c, default)]
     no_right = [c for c in enabled if c.can_invite is False]
     now = _now(app)
-    today = await app.repo.join_counts(t.day_start_ts(app.settings.tz, now))
-    week = await app.repo.join_counts(now - 7 * 24 * 3600)
+    today_start, week_start = t.day_start_ts(app.settings.tz, now), now - 7 * 24 * 3600
+    today = await app.repo.join_counts(today_start)
+    week = await app.repo.join_counts(week_start)
+    declined_today = await app.repo.join_counts(today_start, reason=JOIN_DECLINED)
+    declined_week = await app.repo.join_counts(week_start, reason=JOIN_DECLINED)
+    filter_on = app.settings.join_filter
     lines = [
         "<b>🚪 Автоприём заявок</b>",
         "",
@@ -323,7 +328,10 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
         "",
         f"Включён: <b>{len(enabled)}</b> из {len(chats)}",
         "Новые чаты: " + ("✅ автоприём включается сам" if default else "⏸ без автоприёма"),
-        f"📊 Принято сегодня: {today} · за 7 дней: {week}",
+        "🤖 Подозрительные заявки: "
+        + ("✅ отклоняются (реклама в имени или «о себе»)" if filter_on else "⏸ не проверяются — принимаются все"),
+        f"📊 Сегодня: принято {today}, отклонено {declined_today} · за 7 дней: принято {week}, "
+        f"отклонено {declined_week}",
     ]
     if no_right:
         names = t.names_label([c.title for c in no_right], 5, 30)
@@ -349,6 +357,13 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
         [
             btn("✅ Включить во всех", Guard(a="jall", v=1), GREEN),
             btn("⏸ Выключить во всех", Guard(a="jall", v=0), RED),
+        ]
+    )
+    rows.append(
+        [
+            btn("🤖 Отклонять подозрительных: ✅", Guard(a="jfilter", v=0))
+            if filter_on
+            else btn("🤖 Отклонять подозрительных: ⏸", Guard(a="jfilter", v=1), GREEN)
         ]
     )
     rows.append([btn("« Настройки", Nav(to="settings"))])

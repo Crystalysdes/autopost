@@ -13,7 +13,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.app import App
 from bot.db.models import Campaign, Post, now_ts
-from bot.db.repo import DraftApplied, Target
+from bot.db.repo import JOIN_DECLINED, DraftApplied, Target
 from bot.services import schedule_utils as su
 from bot.services.buttons import buttons_to_html, count_buttons, has_icons
 from bot.services.campaigns import target_problem
@@ -139,8 +139,10 @@ async def main_menu(app: App) -> Screen:
     if spam_today or sub_today:
         lines.append(f"🛡 Сегодня удалено: спам {spam_today} · без подписки {sub_today}")
     joined_today = await app.repo.join_counts(t.day_start_ts(tz, now))
-    if joined_today:
-        lines.append(f"🚪 Сегодня принято заявок: {joined_today}")
+    declined_today = await app.repo.join_counts(t.day_start_ts(tz, now), reason=JOIN_DECLINED)
+    if joined_today or declined_today:
+        line = f"🚪 Сегодня принято заявок: {joined_today}"
+        lines.append(line + (f" · отклонено: {declined_today}" if declined_today else ""))
     if upcoming and not app.settings.paused_all:
         campaign = upcoming[0]
         lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · «{t.esc(campaign.name, 30)}»")
@@ -1379,8 +1381,9 @@ def help_view() -> Screen:
         "экрана или «⚙️ Настройки → 🕶 Скрытые админы») пишут без проверок, как админы чата. Боту нужно право "
         f"«Удаление сообщений», а в каналах для подписки он должен быть админом с правом {t.INVITE_RIGHT}.\n\n"
         "<b>5. Автоприём заявок.</b> Бот сам принимает заявки на вступление в группы и каналы — везде, где они "
-        "есть. Выключить можно галочками в «⚙️ Настройки → 🚪 Автоприём заявок» или на экране чата. Боту нужно "
-        "право приглашать: без него Telegram не присылает ему заявки.\n\n"
+        "есть, а заявки с рекламой в имени или «о себе» отклоняет. Выключить можно галочками в «⚙️ Настройки → "
+        "🚪 Автоприём заявок» или на экране чата. Боту нужно право приглашать: без него Telegram не присылает "
+        "ему заявки.\n\n"
         "<b>6. Команды в группах</b> — ответом на сообщение нарушителя: /del — удалить, /mute и /ban — замутить "
         "и забанить (навсегда или на срок: <code>/mute 1h</code>, <code>/ban 1day</code>), /delmute и /delban — "
         "удалить и наказать, /unmute и /unban — снять. Команда сразу исчезает, в чате не остаётся следов. "

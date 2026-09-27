@@ -90,7 +90,19 @@ async def test_toggles_change_what_is_deleted(feed, app, session, moderator):
 def _all_on() -> dict[str, bool]:
     return {
         name: True
-        for name in ("on", "links", "bots", "forwards", "channels", "words", "length", "contacts", "names", "service")
+        for name in (
+            "on",
+            "links",
+            "bots",
+            "forwards",
+            "channels",
+            "words",
+            "length",
+            "contacts",
+            "names",
+            "service",
+            "addbots",
+        )
     }
 
 

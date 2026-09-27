@@ -328,6 +328,18 @@ async def toggle_join(callback: CallbackQuery, callback_data: Guard, app: App, c
         await show(app, callback, await guard.joins_view(app))
 
 
+@router.callback_query(Guard.filter(F.a == "jfilter"))
+async def toggle_join_filter(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
+    on = bool(callback_data.v)
+    await app.settings.set(app.repo, "join_filter", on)
+    note = (
+        "🤖 Заявки с рекламой в имени или «о себе» теперь отклоняются"
+        if on
+        else "⏸ Подозрительные заявки больше не проверяются — принимаются все"
+    )
+    await show(app, callback, await guard.joins_view(app, note))
+
+
 @router.callback_query(Guard.filter(F.a == "jall"))
 async def join_everywhere(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
     """Общая настройка — для всех чатов и для новых; выбранное отдельно для чатов сбрасывается."""

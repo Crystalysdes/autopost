@@ -248,3 +248,23 @@ def test_long_messages_over_limit():
     photo = [{"file_id": "p", "file_unique_id": "u", "width": 10, "height": 10}]
     assert by_length(msg(photo=photo, caption=long_text), 200) == "length"  # подпись тоже считается
     assert by_length(msg("Коротко"), 200) is None
+
+
+# ---------------------------------------------------------------------------- профиль (заявки на вступление)
+
+
+def test_ads_in_name_and_bio():
+    from bot.services.spam import ad_in_name, ad_in_text
+
+    assert ad_in_name("Заработок в лс", WORDS)
+    assert ad_in_name("Анна @best_offers", WORDS)
+    assert ad_in_name("Маша spam.site", WORDS)
+    assert ad_in_name("зapaбoтoк", WORDS)  # латинские буквы-двойники
+    assert not ad_in_name("Иван Петров", WORDS)
+
+    assert ad_in_text("Пиши @spam_manager", WORDS, ALLOW)
+    assert ad_in_text("Мой магазин: shop.example.com", WORDS, ALLOW)
+    assert ad_in_text("Пассивный доход без вложений", WORDS, ALLOW)
+    assert not ad_in_text("Люблю котов и путешествия", WORDS, ALLOW)
+    assert not ad_in_text("Мой канал @friends_channel, сайт good.ru", WORDS, ALLOW)  # разрешённые
+    assert not ad_in_text("", WORDS, ALLOW)

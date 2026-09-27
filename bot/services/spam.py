@@ -17,7 +17,8 @@ from urllib.parse import urlsplit
 from aiogram.types import Message, MessageEntity
 
 # Порядок важен: причина удаления — первое сработавшее правило
-RULES = ("forwards", "channels", "bots", "links", "contacts", "words", "length", "names", "service")
+# addbots — не про сообщения: бот удаляет Telegram-ботов, которых добавил в группу не админ
+RULES = ("forwards", "channels", "bots", "links", "contacts", "words", "length", "names", "service", "addbots")
 RULE_TITLES = {
     "links": "🔗 Ссылки",
     "bots": "🤖 Боты и каналы",
@@ -28,6 +29,7 @@ RULE_TITLES = {
     "contacts": "📇 Контакты и гео",
     "names": "👤 Реклама в имени",
     "service": "🚪 Вход и выход",
+    "addbots": "🤖 Добавленные боты",
 }
 REASON_TITLES = {**RULE_TITLES, "sub": "🔒 Нет подписки"}
 
@@ -113,6 +115,7 @@ class SpamRules:
     contacts: bool = True
     names: bool = True
     service: bool = True
+    addbots: bool = True
 
     @classmethod
     def of(cls, data: dict[str, Any] | None) -> SpamRules:
@@ -201,6 +204,29 @@ def has_stop_word(text: str, compiled: Sequence[tuple[re.Pattern[str], re.Patter
     plain = normalize(text)
     looks = plain.translate(_LOOKALIKES)
     return any(p.search(plain) or q.search(looks) for p, q in compiled)
+
+
+def ad_in_name(name: str, stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]]) -> bool:
+    """Реклама в имени: ссылка, «@ник» или стоп-слово."""
+    return bool(find_links(name) or _AT_IN_NAME.search(normalize(name)) or has_stop_word(name, stop_words))
+
+
+def ad_in_text(
+    text: str,
+    stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]],
+    allow: Allowlist | None = None,
+) -> bool:
+    """Реклама в тексте профиля («о себе»): ссылка, @упоминание или стоп-слово. Разрешённые ссылки
+    и @имена (свой сайт, свой канал) не считаются."""
+    if not text:
+        return False
+    allow = allow or Allowlist()
+    if any(not allow.allows_url(link) for link in find_links(text)):
+        return True
+    names = (match.group(1) for match in _USERNAME_IN_TEXT.finditer(normalize(text)))
+    if any(name not in allow.names for name in names):
+        return True
+    return has_stop_word(text, stop_words)
 
 
 def find_links(text: str) -> list[str]:
@@ -346,11 +372,13 @@ def detect(
     if rules.length and max_len > 0 and sum(len(chunk) for chunk in texts) > max_len:
         return Verdict("length", mentions)
 
-    if rules.names and message.from_user and not message.sender_chat:
-        name = message.from_user.full_name
-        plain = normalize(name)
-        if find_links(name) or _AT_IN_NAME.search(plain) or has_stop_word(name, stop_words):
-            return Verdict("names", mentions)
+    if (
+        rules.names
+        and message.from_user
+        and not message.sender_chat
+        and ad_in_name(message.from_user.full_name, stop_words)
+    ):
+        return Verdict("names", mentions)
 
     return Verdict(None, mentions)
 

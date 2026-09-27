@@ -8,7 +8,7 @@ import contextlib
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, ChatJoinRequest, Message
+from aiogram.types import CallbackQuery, ChatJoinRequest, ChatMemberUpdated, Message
 from aiogram.utils.callback_answer import CallbackAnswer
 
 from bot.app import App
@@ -37,6 +37,13 @@ async def on_group_edit(message: Message, app: App) -> None:
     """Спамеры пишут безобидный текст, а ссылку добавляют правкой."""
     if app.moderator is not None:
         await app.moderator.handle(message, edited=True)
+
+
+@router.chat_member(F.chat.type.in_({"group", "supergroup"}), F.new_chat_member.user.is_bot)
+async def on_bot_added(event: ChatMemberUpdated, app: App) -> None:
+    """В группу добавили Telegram-бота (остальные изменения участников фильтр отбрасывает сразу)."""
+    if app.moderator is not None:
+        await app.moderator.bot_added(event)
 
 
 @router.chat_join_request()

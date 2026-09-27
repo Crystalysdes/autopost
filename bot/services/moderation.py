@@ -32,11 +32,11 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.types import ChatJoinRequest, Message, User
+from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message, User
 
 from bot.app import NO_PREVIEW, App
 from bot.db.models import Chat
-from bot.db.repo import JOIN_REASON
+from bot.db.repo import JOIN_DECLINED, JOIN_REASON
 from bot.services import chats as chat_service
 from bot.services import spam, trusted
 from bot.services.errors import humanize
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 GROUP_TYPES = ("group", "supergroup")
 TELEGRAM_SERVICE_ID = 777000  # служебный аккаунт Telegram (пересылает посты канала в группу обсуждения)
+ANONYMOUS_ADMIN_ID = 1087968824  # от его имени действуют анонимные админы группы
 SUBSCRIBED = {"creator", "administrator", "member"}
 
 CHAT_TTL = 60  # настройки чата (правки из бота сбрасывают кэш сразу)
@@ -578,25 +579,54 @@ class Moderator:
     # ------------------------------------------------------------------ заявки на вступление
 
     async def join_request(self, request: ChatJoinRequest) -> None:
-        """Заявка в группу или канал: если там включён автоприём — принять сразу. Иначе заявку рассмотрят
-        админы чата, как обычно."""
+        """Заявка в группу или канал: если там включён автоприём — принять сразу, а подозрительную
+        (реклама в имени или «о себе») — отклонить. Без автоприёма заявку рассмотрят админы чата."""
         chat = await self.app.repo.get_chat_by_tg(request.chat.id)
         if chat is None or chat.status != "active" or not auto_approve_on(chat, self.app.settings.join_auto):
             return
         user = request.from_user
+        suspicion = self.join_suspicion(request, chat) if self.app.settings.join_filter else None
+        if not await self._answer_join(chat, user, approve=suspicion is None):
+            return
+        if suspicion:
+            logger.info("Автоприём: заявка %s в «%s» отклонена — %s", user.full_name, chat.title, suspicion)
+        else:
+            logger.debug("Автоприём: %s принят в «%s»", user.full_name, chat.title)  # итоги — на экранах бота
+        await self.app.repo.log_moderation(
+            chat.id,
+            user_id=user.id,
+            user_name=user.full_name,
+            reason=JOIN_DECLINED if suspicion else JOIN_REASON,
+            snippet=suspicion,
+            now=int(self.wall()),
+        )
+
+    def join_suspicion(self, request: ChatJoinRequest, chat: Chat) -> str | None:
+        """Почему заявка похожа на спам-аккаунт; None — всё в порядке."""
+        words = self.stop_words()
+        if spam.ad_in_name(request.from_user.full_name, words):
+            return "реклама в имени"
+        allow = spam.build_allowlist(self.app.settings.spam_allow, [chat.username, self.app.bot_username])
+        if request.bio and spam.ad_in_text(request.bio, words, allow):
+            return "реклама в «о себе»"
+        return None
+
+    async def _answer_join(self, chat: Chat, user: User, *, approve: bool) -> bool:
+        """Принять или отклонить заявку. False — не вышло (уже рассмотрена, нет прав, лимит)."""
+        method = self.app.bot.approve_chat_join_request if approve else self.app.bot.decline_chat_join_request
         for attempt in range(1, JOIN_ATTEMPTS + 1):
             try:
-                await self.app.bot.approve_chat_join_request(chat.tg_id, user.id)
+                await method(chat.tg_id, user.id)
             except TelegramRetryAfter as error:
                 if attempt < JOIN_ATTEMPTS and error.retry_after <= JOIN_RETRY_LIMIT:
                     await asyncio.sleep(error.retry_after)
                     continue
-                logger.warning("Заявка %s в «%s» не принята: лимит Telegram", user.id, chat.title)
-                return
+                logger.warning("Заявка %s в «%s» не рассмотрена: лимит Telegram", user.id, chat.title)
+                return False
             except TelegramBadRequest as error:
                 text = error.message.lower()
                 if any(marker in text for marker in JOIN_ALREADY_DONE):
-                    return
+                    return False
                 if "right" in text or "admin_required" in text:
                     await self._problem(
                         (chat.tg_id, "join"),
@@ -604,15 +634,52 @@ class Moderator:
                         keyboards.open_chat(chat.id),
                     )
                 else:
-                    logger.info("Заявка %s в «%s» не принята: %s", user.id, chat.title, error.message)
-                return
+                    logger.info("Заявка %s в «%s» не рассмотрена: %s", user.id, chat.title, error.message)
+                return False
             except TelegramAPIError as error:
-                logger.info("Заявка %s в «%s» не принята: %s", user.id, chat.title, error)
-                return
-            break
-        logger.debug("Автоприём: %s принят в «%s»", user.full_name, chat.title)  # итоги — на экранах бота
+                logger.info("Заявка %s в «%s» не рассмотрена: %s", user.id, chat.title, error)
+                return False
+            return True
+        return False
+
+    # ------------------------------------------------------------------ добавленные боты
+
+    async def bot_added(self, event: ChatMemberUpdated) -> None:
+        """В группу добавили Telegram-бота. Если это сделал не админ (бота, чата или скрытый), бот
+        удаляется и банится, чтобы его не добавили снова (правило «🤖 Добавленные боты»)."""
+        joined = enum_text(event.new_chat_member.status) in ("member", "restricted")
+        was_out = enum_text(event.old_chat_member.status) in ("left", "kicked")
+        target = event.new_chat_member.user
+        if not (joined and was_out) or target.id == self.app.bot_id:
+            return  # не вступление (вышел, стал админом) или это мы сами
+        info = await self.chat_info(event.chat.id)
+        adder = event.from_user
+        if info is None or not info.rules.enabled("addbots"):
+            return
+        if adder.id == ANONYMOUS_ADMIN_ID or await self.is_moderator(info, adder):
+            return
+        try:
+            await self.app.bot.ban_chat_member(info.tg_id, target.id)
+        except TelegramBadRequest as error:
+            text = error.message.lower()
+            if "right" in text or "admin_required" in text:
+                await self._problem(
+                    (info.tg_id, "addbots"), texts.bot_not_removed_text(info.title), keyboards.open_chat(info.id)
+                )
+            else:
+                logger.info("Не удалось удалить бота @%s из «%s»: %s", target.username, info.title, error.message)
+            return
+        except TelegramAPIError as error:
+            logger.info("Не удалось удалить бота @%s из «%s»: %s", target.username, info.title, error)
+            return
+        logger.info("Защита: удалён бот @%s, которого добавил %s в «%s»", target.username, adder.full_name, info.title)
         await self.app.repo.log_moderation(
-            chat.id, user_id=user.id, user_name=user.full_name, reason=JOIN_REASON, snippet=None, now=int(self.wall())
+            info.id,
+            user_id=target.id,
+            user_name=f"@{target.username}" if target.username else target.full_name,
+            reason="addbots",
+            snippet=f"добавил(а): {adder.full_name}",
+            now=int(self.wall()),
         )
 
     # ------------------------------------------------------------------ удаление

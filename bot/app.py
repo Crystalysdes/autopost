@@ -41,6 +41,8 @@ class AppSettings:
         self.sub_channels: list[int] = []  # общие каналы обязательной подписки (id записей чатов)
         # Автоприём заявок в чатах, где он не выбран отдельно (в том числе в новых)
         self.join_auto = True
+        # Заявки с рекламой в имени или «о себе» при автоприёме отклоняются
+        self.join_filter = True
         # Скрытые админы во всех группах (см. bot/services/trusted.py)
         self.trusted: list[dict[str, Any]] = []
 
@@ -61,6 +63,8 @@ class AppSettings:
             self.notify_errors = value == "1"
         elif key == "join_auto":
             self.join_auto = value == "1"
+        elif key == "join_filter":
+            self.join_filter = value == "1"
         elif key == "spam_max_len":
             self.spam_max_len = int(value) if value.isdigit() else 0
         elif key in ("spam_words", "spam_allow", "sub_channels", "trusted"):

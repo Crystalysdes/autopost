@@ -14,6 +14,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import (
     AnswerCallbackQuery,
+    BanChatMember,
     CreateChatInviteLink,
     DeleteMessage,
     DeleteMessages,
@@ -23,7 +24,16 @@ from aiogram.methods import (
     GetChatMember,
     SendMessage,
 )
-from aiogram.types import CallbackQuery, Chat, ChatMemberLeft, ChatMemberMember, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberUpdated,
+    Message,
+    Update,
+    User,
+)
 
 from bot.services.moderation import LINK_LIFETIME, NOTICE_LIFETIME, SUB_NO_TTL, Moderator, invite_name
 from bot.ui.callbacks import Nav, SubCheck
@@ -558,3 +568,81 @@ async def test_group_traffic_does_not_grow_fsm_storage(feed, dp, app, moderator)
     for n in range(30):
         await feed(group_msg(user=User(id=50_000 + n, is_bot=False, first_name="U"), text="привет"))
     assert len(dp.fsm.storage.storage) == 0
+
+
+# ------------------------------------------------------------------------ добавленные боты
+
+SPAM_BOT = User(id=6001, is_bot=True, first_name="Spam", username="spam_promo_bot")
+
+
+def bot_joins(adder: User, bot: User = SPAM_BOT, *, as_admin: bool = False) -> Update:
+    event = ChatMemberUpdated(
+        chat=Chat(id=GROUP, type="supergroup", title="Группа"),
+        from_user=adder,
+        date=datetime.now(),
+        old_chat_member=ChatMemberLeft(user=bot),
+        new_chat_member=chat_admin(bot) if as_admin else ChatMemberMember(user=bot),
+    )
+    return Update(update_id=next(_ids), chat_member=event)
+
+
+async def test_bot_added_by_member_is_removed(feed, app, session, moderator):
+    chat = await setup_group(feed, app)
+    session.clear()
+    await feed(bot_joins(STRANGER))
+    (ban,) = session.calls(BanChatMember)
+    assert ban.user_id == SPAM_BOT.id and ban.chat_id == GROUP
+    log = (await app.repo.last_moderation(chat.id))[0]
+    assert log.reason == "addbots" and log.user_name == "@spam_promo_bot" and "Спамер" in log.snippet
+
+
+async def test_bots_added_by_admins_stay(feed, app, session, moderator):
+    await setup_group(feed, app)
+    session.handlers[GetChatAdministrators] = lambda method: [chat_admin(MEMBER)]
+    owner = User(id=OWNER_ID, is_bot=False, first_name="Владелец")
+    await feed(
+        bot_joins(MEMBER),  # админ чата
+        bot_joins(owner),  # админ бота
+        bot_joins(STRANGER, as_admin=True),  # бота сразу сделали админом — это мог только админ
+    )
+    assert session.calls(BanChatMember) == []
+
+
+async def test_added_bots_rule_can_be_switched_off(feed, app, session, moderator):
+    chat = await setup_group(feed, app)
+    await app.repo.update_chat(chat.id, spam_filter={"addbots": False})
+    moderator.forget()
+    await feed(bot_joins(STRANGER))
+    assert session.calls(BanChatMember) == []
+
+
+async def test_bot_removal_without_right_is_reported_once(feed, app, session, moderator):
+    await setup_group(feed, app)
+    method = BanChatMember(chat_id=GROUP, user_id=SPAM_BOT.id)
+    for _ in range(2):
+        refused = TelegramBadRequest(
+            method=method, message="Bad Request: not enough rights to restrict/unrestrict chat member"
+        )
+        session.queue(BanChatMember, refused)
+    await feed(bot_joins(STRANGER), bot_joins(STRANGER))
+    reports = [c for c in session.calls(SendMessage) if c.chat_id == OWNER_ID and "добавил бота" in c.text]
+    assert len(reports) == 1
+
+
+async def test_people_joining_cost_no_requests(feed, app, session, moderator):
+    await setup_group(feed, app)
+    session.clear()
+    human = User(id=6100, is_bot=False, first_name="Человек")
+    event = ChatMemberUpdated(
+        chat=Chat(id=GROUP, type="supergroup", title="Группа"),
+        from_user=human,
+        date=datetime.now(),
+        old_chat_member=ChatMemberLeft(user=human),
+        new_chat_member=ChatMemberMember(user=human),
+    )
+    await feed(Update(update_id=next(_ids), chat_member=event))
+    assert session.requests == []
+
+
+def test_bot_subscribes_to_member_updates(dp):
+    assert "chat_member" in dp.resolve_used_update_types()

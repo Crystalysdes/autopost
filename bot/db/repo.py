@@ -42,6 +42,8 @@ NAME_LIMIT = 64
 GROUP_TYPES = ("group", "supergroup")
 MODERATION_KEEP_SECONDS = 14 * 24 * 3600  # журнал удалённого защитой хранится две недели
 JOIN_REASON = "join"  # в том же журнале — заявки на вступление, которые бот принял сам
+JOIN_DECLINED = "join_no"  # и отклонил как подозрительные
+JOIN_REASONS = (JOIN_REASON, JOIN_DECLINED)
 
 
 @dataclass
@@ -378,15 +380,16 @@ class Repo:
             if chat_id is not None:
                 query = query.where(ModerationLog.chat_id == chat_id)
             counts = {reason: int(count) for reason, count in await s.execute(query.group_by(ModerationLog.reason))}
-        counts.pop(JOIN_REASON, 0)  # принятые заявки — не удаления
+        for reason in JOIN_REASONS:  # заявки на вступление — не удаления
+            counts.pop(reason, 0)
         sub = counts.pop("sub", 0)
         return sum(counts.values()), sub
 
-    async def join_counts(self, since_ts: int, chat_id: int | None = None) -> int:
-        """Сколько заявок на вступление бот принял начиная с since_ts."""
+    async def join_counts(self, since_ts: int, chat_id: int | None = None, reason: str = JOIN_REASON) -> int:
+        """Сколько заявок на вступление бот принял (или отклонил — reason=JOIN_DECLINED) начиная с since_ts."""
         async with self.db.session() as s:
             query = select(func.count(ModerationLog.id)).where(
-                ModerationLog.reason == JOIN_REASON, ModerationLog.ts >= since_ts
+                ModerationLog.reason == reason, ModerationLog.ts >= since_ts
             )
             if chat_id is not None:
                 query = query.where(ModerationLog.chat_id == chat_id)
@@ -397,7 +400,7 @@ class Repo:
         async with self.db.session() as s:
             rows = await s.scalars(
                 select(ModerationLog)
-                .where(ModerationLog.chat_id == chat_id, ModerationLog.reason != JOIN_REASON)
+                .where(ModerationLog.chat_id == chat_id, ModerationLog.reason.not_in(JOIN_REASONS))
                 .order_by(ModerationLog.ts.desc(), ModerationLog.id.desc())
                 .limit(limit)
             )

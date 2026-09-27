@@ -254,6 +254,13 @@ def no_delete_right_text(title: str) -> str:
     )
 
 
+def bot_not_removed_text(title: str) -> str:
+    return (
+        f"🤖 В «<b>{esc(title)}</b>» участник добавил бота, а удалить его не получилось: у бота нет права "
+        "«Блокировка пользователей». Выдайте его в настройках администраторов группы."
+    )
+
+
 def no_join_right_text(title: str, chat_type: str) -> str:
     return (
         f"🚪 Автоприём заявок в «<b>{esc(title)}</b>» не работает: Telegram не даёт боту принимать заявки.\n\n"
