@@ -90,6 +90,7 @@ _LINK_PATTERNS = (
     re.compile(r"(?<![\w.@-])(?:[а-я0-9](?:[а-я0-9-]{0,61}[а-я0-9])?\.)+рф(?![\w-])(?:/\S*)?"),
 )
 _TELEGRAM_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
+_TRAILING = ".,!?;:)]}»\"'…"
 _USERNAME_IN_TEXT = re.compile(r"(?<![\w@])@([a-z][a-z0-9_]{3,31})(?![\w])")
 _AT_IN_NAME = re.compile(r"@\s*[a-z0-9_]{4,}")
 
@@ -199,34 +200,47 @@ def compile_stop_words(words: Sequence[str]) -> list[tuple[re.Pattern[str], re.P
 
 
 def has_stop_word(text: str, compiled: Sequence[tuple[re.Pattern[str], re.Pattern[str]]]) -> bool:
+    return stop_word_in(text, compiled) is not None
+
+
+def stop_word_in(text: str, compiled: Sequence[tuple[re.Pattern[str], re.Pattern[str]]]) -> str | None:
+    """Найденное стоп-слово (как оно написано в тексте, в нижнем регистре) или None."""
     if not text:
-        return False
+        return None
     plain = normalize(text)
     looks = plain.translate(_LOOKALIKES)
-    return any(p.search(plain) or q.search(looks) for p, q in compiled)
+    for p, q in compiled:
+        match = p.search(plain) or q.search(looks)
+        if match:
+            return plain[match.start() : match.end()]
+    return None
 
 
-def ad_in_name(name: str, stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]]) -> bool:
-    """Реклама в имени: ссылка, «@ник» или стоп-слово."""
-    return bool(find_links(name) or _AT_IN_NAME.search(normalize(name)) or has_stop_word(name, stop_words))
+def ad_in_name(name: str, stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]]) -> str | None:
+    """Реклама в имени — что именно нашлось: ссылка, «@ник» или стоп-слово. None — имя чистое."""
+    links = find_links(name)
+    if links:
+        return links[0]
+    at = _AT_IN_NAME.search(normalize(name))
+    if at:
+        return at.group(0).replace(" ", "")
+    return stop_word_in(name, stop_words)
 
 
-def ad_in_text(
+def ad_in_bio(
     text: str,
     stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]],
     allow: Allowlist | None = None,
-) -> bool:
-    """Реклама в тексте профиля («о себе»): ссылка, @упоминание или стоп-слово. Разрешённые ссылки
-    и @имена (свой сайт, свой канал) не считаются."""
+) -> str | None:
+    """Реклама в «о себе» — что нашлось: ссылка или стоп-слово. @упоминания не в счёт: у многих людей
+    там свой канал. Разрешённые ссылки (свой сайт, свой канал) не считаются."""
     if not text:
-        return False
+        return None
     allow = allow or Allowlist()
-    if any(not allow.allows_url(link) for link in find_links(text)):
-        return True
-    names = (match.group(1) for match in _USERNAME_IN_TEXT.finditer(normalize(text)))
-    if any(name not in allow.names for name in names):
-        return True
-    return has_stop_word(text, stop_words)
+    for link in find_links(text):
+        if not allow.allows_url(link):
+            return link
+    return stop_word_in(text, stop_words)
 
 
 def find_links(text: str) -> list[str]:
@@ -403,8 +417,9 @@ def _url_parts(raw: str) -> tuple[str, str]:
         parts = urlsplit(value)
     except ValueError:
         return "", ""
-    host = (parts.hostname or "").removeprefix("www.")
-    first = parts.path.strip("/").split("/")[0] if parts.path else ""
+    # Знаки препинания после ссылки («good.ru,», «(t.me/chan)») к ней не относятся
+    host = (parts.hostname or "").removeprefix("www.").rstrip(_TRAILING)
+    first = parts.path.strip("/").split("/")[0].rstrip(_TRAILING) if parts.path else ""
     return host, first.lstrip("@")
 
 

@@ -42,8 +42,9 @@ NAME_LIMIT = 64
 GROUP_TYPES = ("group", "supergroup")
 MODERATION_KEEP_SECONDS = 14 * 24 * 3600  # журнал удалённого защитой хранится две недели
 JOIN_REASON = "join"  # в том же журнале — заявки на вступление, которые бот принял сам
-JOIN_DECLINED = "join_no"  # и отклонил как подозрительные
-JOIN_REASONS = (JOIN_REASON, JOIN_DECLINED)
+JOIN_DECLINED = "join_no"  # отклонил (кнопкой админа в боте)
+JOIN_WAIT = "join_wait"  # подозрительные: бот их не принял сам, ждут решения админа
+JOIN_REASONS = (JOIN_REASON, JOIN_DECLINED, JOIN_WAIT)
 
 
 @dataclass
@@ -394,6 +395,33 @@ class Repo:
             if chat_id is not None:
                 query = query.where(ModerationLog.chat_id == chat_id)
             return int(await s.scalar(query) or 0)
+
+    async def waiting_joins(self, since_ts: int, limit: int = 20) -> list[ModerationLog]:
+        """Подозрительные заявки, которые ждут решения админа, — новые первыми."""
+        async with self.db.session() as s:
+            rows = await s.scalars(
+                select(ModerationLog)
+                .where(ModerationLog.reason == JOIN_WAIT, ModerationLog.ts >= since_ts)
+                .order_by(ModerationLog.ts.desc(), ModerationLog.id.desc())
+                .limit(limit)
+            )
+            return list(rows.all())
+
+    async def get_moderation(self, entry_id: int) -> ModerationLog | None:
+        async with self.db.session() as s:
+            return await s.get(ModerationLog, entry_id)
+
+    async def set_moderation_reason(self, entry_id: int, reason: str | None) -> None:
+        """Сменить итог записи журнала; None — удалить запись (например, заявку уже рассмотрели в Telegram)."""
+        async with self.db.session() as s:
+            entry = await s.get(ModerationLog, entry_id)
+            if entry is None:
+                return
+            if reason is None:
+                await s.delete(entry)
+            else:
+                entry.reason = reason
+            await s.commit()
 
     async def last_moderation(self, chat_id: int, limit: int = 10) -> list[ModerationLog]:
         """Последние удалённые сообщения (принятые заявки сюда не входят)."""

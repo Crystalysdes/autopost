@@ -254,17 +254,25 @@ def test_long_messages_over_limit():
 
 
 def test_ads_in_name_and_bio():
-    from bot.services.spam import ad_in_name, ad_in_text
+    from bot.services.spam import ad_in_bio, ad_in_name
 
-    assert ad_in_name("Заработок в лс", WORDS)
-    assert ad_in_name("Анна @best_offers", WORDS)
-    assert ad_in_name("Маша spam.site", WORDS)
+    # в ответе — что именно нашлось: это видно админу в «🕵️ На проверке»
+    assert ad_in_name("Заработок в лс", WORDS) == "заработок"
+    assert ad_in_name("Анна @best_offers", WORDS) == "@best_offers"
+    assert ad_in_name("Маша spam.site", WORDS) == "spam.site"
     assert ad_in_name("зapaбoтoк", WORDS)  # латинские буквы-двойники
-    assert not ad_in_name("Иван Петров", WORDS)
+    assert ad_in_name("Иван Петров", WORDS) is None
 
-    assert ad_in_text("Пиши @spam_manager", WORDS, ALLOW)
-    assert ad_in_text("Мой магазин: shop.example.com", WORDS, ALLOW)
-    assert ad_in_text("Пассивный доход без вложений", WORDS, ALLOW)
-    assert not ad_in_text("Люблю котов и путешествия", WORDS, ALLOW)
-    assert not ad_in_text("Мой канал @friends_channel, сайт good.ru", WORDS, ALLOW)  # разрешённые
-    assert not ad_in_text("", WORDS, ALLOW)
+    assert ad_in_bio("Мой магазин: shop.example.com", WORDS, ALLOW) == "shop.example.com"
+    assert ad_in_bio("Пассивный доход без вложений", WORDS, ALLOW) == "пассивный доход"
+    assert ad_in_bio("Пишите в лс", WORDS, ALLOW) == "в лс"
+    assert ad_in_bio("Мой канал @ivan_blog", WORDS, ALLOW) is None  # @канал в «о себе» — это нормально
+    assert ad_in_bio("Люблю котов и путешествия", WORDS, ALLOW) is None
+    assert ad_in_bio("Сайт good.ru, канал t.me/friends_channel", WORDS, ALLOW) is None  # разрешённые
+    assert ad_in_bio("", WORDS, ALLOW) is None
+
+
+def test_allowed_links_with_punctuation_after_them():
+    for text in ["Заходите на good.ru, там всё", "Сайт: good.ru.", "(good.ru)", "Канал t.me/friends_channel!"]:
+        assert reason(msg(text)) is None, text
+    assert reason(msg("Заходите на spam.site, там всё")) == "links"

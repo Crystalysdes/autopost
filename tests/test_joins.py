@@ -179,30 +179,60 @@ async def test_missing_right_is_reported_once_a_day(feed, app, session, moderato
 SPAMMER = User(id=5100, is_bot=False, first_name="Заработок", last_name="в лс")
 
 
-async def test_suspicious_requests_are_declined(feed, app, session, moderator):
+async def test_suspicious_requests_wait_for_admin(feed, app, session, moderator):
     group = await add_with_invite(feed, app, GROUP)
     session.clear()
-    promoter = User(id=5101, is_bot=False, first_name="Анна")
+    promoter = User(id=5101, is_bot=False, first_name="Анна", username="anna_design")
+    blogger = User(id=5103, is_bot=False, first_name="Олег")
     await feed(
         join_request(GROUP, user=SPAMMER),  # реклама в имени
-        join_request(GROUP, user=promoter, bio="Пиши @spam_manager — всё расскажу"),  # в «о себе»
+        join_request(GROUP, user=promoter, bio="Портфолио: behance.net/anna"),  # ссылка в «о себе»
+        join_request(GROUP, user=blogger, bio="Мой канал @oleg_blog"),  # @канал — это нормально
         join_request(GROUP, user=User(id=5102, is_bot=False, first_name="Катя"), bio="Люблю котов"),
     )
-    assert declined(session) == [(GROUP, SPAMMER.id), (GROUP, promoter.id)]
-    assert approved(session) == [(GROUP, 5102)]
-    assert await app.repo.join_counts(0) == 1
-    assert await app.repo.join_counts(0, reason="join_no") == 2
+    assert declined(session) == []  # бот никого не отклоняет
+    assert approved(session) == [(GROUP, blogger.id), (GROUP, 5102)]  # подозрительных не принял — ждут админа
+    assert await app.repo.join_counts(0) == 2
+    assert await app.repo.join_counts(0, reason="join_wait") == 2
     assert await app.repo.moderation_counts(0) == (0, 0)  # не удалённый спам
     assert await app.repo.last_moderation(group.id) == []  # и не «Последние удалённые»
 
     await feed(press(Nav(to="main")))
-    assert "Сегодня принято заявок: 1 · отклонено: 2" in owner_texts(session)[-1]
+    assert "Сегодня принято заявок: 2 · на проверке: 2" in owner_texts(session)[-1]
+    await feed(press(Guard(a="joins")))
+    assert "Ждут вашего решения: <b>2</b>" in owner_texts(session)[-1]
+    await feed(press(Guard(a="jwait")))
+    text = owner_texts(session)[-1]
+    assert "Анна (@anna_design)" in text and "в «о себе»: behance.net/anna" in text
+    assert "в имени: заработок" in text
+
+    entries = {entry.user_id: entry for entry in await app.repo.waiting_joins(0)}
+    await feed(press(Guard(a="jok", id=entries[promoter.id].id)))
+    assert (GROUP, promoter.id) in approved(session)
+    assert session.calls(AnswerCallbackQuery)[-1].text == "✅ Заявка принята"
+    await feed(press(Guard(a="jno", id=entries[SPAMMER.id].id)))
+    assert declined(session) == [(GROUP, SPAMMER.id)]
+    assert await app.repo.waiting_joins(0) == []
+    assert await app.repo.join_counts(0) == 3 and await app.repo.join_counts(0, reason="join_no") == 1
+
+    await feed(press(Guard(a="jok", id=entries[promoter.id].id)))  # повторное нажатие
+    assert "уже рассмотрели" in session.calls(AnswerCallbackQuery)[-1].text
+
+
+async def test_request_handled_in_telegram_leaves_the_list(feed, app, session, moderator):
+    await add_with_invite(feed, app, GROUP)
+    await feed(join_request(GROUP, user=SPAMMER))
+    (entry,) = await app.repo.waiting_joins(0)
+    session.queue(ApproveChatJoinRequest, refusal("Bad Request: HIDE_REQUESTER_MISSING"))  # админ уже решил сам
+    await feed(press(Guard(a="jok", id=entry.id)))
+    assert "уже рассмотрели" in session.calls(AnswerCallbackQuery)[-1].text
+    assert await app.repo.waiting_joins(0) == []
 
 
 async def test_filter_can_be_switched_off(feed, app, session, moderator):
     await add_with_invite(feed, app, GROUP)
     await feed(press(Guard(a="joins")))
-    assert "🤖 Подозрительные заявки: ✅ отклоняются" in owner_texts(session)[-1]
+    assert "✅ бот их не принимает — они ждут вас" in owner_texts(session)[-1]
     await feed(press(Guard(a="jfilter", v=0)))
     assert app.settings.join_filter is False
     assert "⏸ не проверяются" in owner_texts(session)[-1]
@@ -270,7 +300,7 @@ async def test_accepted_requests_are_counted_on_screens(feed, app, session, mode
     assert "✅ приглашения" in owner_texts(session)[-1]
     assert "сегодня принято 1" in owner_texts(session)[-1]
     await feed(press(Guard(a="joins")))
-    assert "Сегодня: принято 1, отклонено 0 · за 7 дней: принято 1, отклонено 0" in owner_texts(session)[-1]
+    assert "Сегодня: принято 1, на проверку 0 · за 7 дней: принято 1" in owner_texts(session)[-1]
 
 
 # ------------------------------------------------------------------------ прочее

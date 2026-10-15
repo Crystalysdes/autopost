@@ -36,7 +36,7 @@ from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message, User
 
 from bot.app import NO_PREVIEW, App
 from bot.db.models import Chat
-from bot.db.repo import JOIN_DECLINED, JOIN_REASON
+from bot.db.repo import JOIN_DECLINED, JOIN_REASON, JOIN_WAIT
 from bot.services import chats as chat_service
 from bot.services import spam, trusted
 from bot.services.errors import humanize
@@ -579,54 +579,71 @@ class Moderator:
     # ------------------------------------------------------------------ заявки на вступление
 
     async def join_request(self, request: ChatJoinRequest) -> None:
-        """Заявка в группу или канал: если там включён автоприём — принять сразу, а подозрительную
-        (реклама в имени или «о себе») — отклонить. Без автоприёма заявку рассмотрят админы чата."""
+        """Заявка в группу или канал: если там включён автоприём — принять сразу. Подозрительную
+        (ссылка или стоп-слово в «о себе», реклама в имени) бот не принимает и не отклоняет: она остаётся
+        в обычном списке заявок Telegram, а в боте — в «🕵️ На проверке» с причиной.
+        Без автоприёма заявку рассмотрят админы чата, как обычно."""
         chat = await self.app.repo.get_chat_by_tg(request.chat.id)
         if chat is None or chat.status != "active" or not auto_approve_on(chat, self.app.settings.join_auto):
             return
         user = request.from_user
         suspicion = self.join_suspicion(request, chat) if self.app.settings.join_filter else None
-        if not await self._answer_join(chat, user, approve=suspicion is None):
-            return
         if suspicion:
-            logger.info("Автоприём: заявка %s в «%s» отклонена — %s", user.full_name, chat.title, suspicion)
+            logger.info("Автоприём: заявка %s в «%s» ждёт админа — %s", user.full_name, chat.title, suspicion)
+        elif await self._answer_join(chat, user.id, approve=True) != "ok":
+            return
         else:
             logger.debug("Автоприём: %s принят в «%s»", user.full_name, chat.title)  # итоги — на экранах бота
+        name = f"{user.full_name} (@{user.username})" if user.username else user.full_name
         await self.app.repo.log_moderation(
             chat.id,
             user_id=user.id,
-            user_name=user.full_name,
-            reason=JOIN_DECLINED if suspicion else JOIN_REASON,
+            user_name=name,
+            reason=JOIN_WAIT if suspicion else JOIN_REASON,
             snippet=suspicion,
             now=int(self.wall()),
         )
 
     def join_suspicion(self, request: ChatJoinRequest, chat: Chat) -> str | None:
-        """Почему заявка похожа на спам-аккаунт; None — всё в порядке."""
+        """Почему заявку стоит проверить админу — с тем, что нашлось; None — всё в порядке."""
         words = self.stop_words()
-        if spam.ad_in_name(request.from_user.full_name, words):
-            return "реклама в имени"
+        found = spam.ad_in_name(request.from_user.full_name, words)
+        if found:
+            return f"в имени: {found}"
         allow = spam.build_allowlist(self.app.settings.spam_allow, [chat.username, self.app.bot_username])
-        if request.bio and spam.ad_in_text(request.bio, words, allow):
-            return "реклама в «о себе»"
-        return None
+        found = spam.ad_in_bio(request.bio or "", words, allow)
+        return f"в «о себе»: {found}" if found else None
 
-    async def _answer_join(self, chat: Chat, user: User, *, approve: bool) -> bool:
-        """Принять или отклонить заявку. False — не вышло (уже рассмотрена, нет прав, лимит)."""
+    async def decide_join(self, entry_id: int, *, approve: bool) -> str:
+        """Решение админа по заявке из «🕵️ На проверке»: ok — сделано, gone — заявку уже рассмотрели
+        (в Telegram или раньше), error — не вышло сейчас (нет прав, лимит, связь)."""
+        entry = await self.app.repo.get_moderation(entry_id)
+        chat = await self.app.repo.get_chat(entry.chat_id) if entry else None
+        if entry is None or entry.reason != JOIN_WAIT or chat is None or entry.user_id is None:
+            return "gone"
+        result = await self._answer_join(chat, entry.user_id, approve=approve)
+        if result == "ok":
+            await self.app.repo.set_moderation_reason(entry.id, JOIN_REASON if approve else JOIN_DECLINED)
+        elif result == "gone":
+            await self.app.repo.set_moderation_reason(entry.id, None)
+        return result
+
+    async def _answer_join(self, chat: Chat, user_id: int, *, approve: bool) -> str:
+        """Принять или отклонить заявку: ok, gone (её уже рассмотрели) или error (нет прав, лимит, связь)."""
         method = self.app.bot.approve_chat_join_request if approve else self.app.bot.decline_chat_join_request
         for attempt in range(1, JOIN_ATTEMPTS + 1):
             try:
-                await method(chat.tg_id, user.id)
+                await method(chat.tg_id, user_id)
             except TelegramRetryAfter as error:
                 if attempt < JOIN_ATTEMPTS and error.retry_after <= JOIN_RETRY_LIMIT:
                     await asyncio.sleep(error.retry_after)
                     continue
-                logger.warning("Заявка %s в «%s» не рассмотрена: лимит Telegram", user.id, chat.title)
-                return False
+                logger.warning("Заявка %s в «%s» не рассмотрена: лимит Telegram", user_id, chat.title)
+                return "error"
             except TelegramBadRequest as error:
                 text = error.message.lower()
                 if any(marker in text for marker in JOIN_ALREADY_DONE):
-                    return False
+                    return "gone"
                 if "right" in text or "admin_required" in text:
                     await self._problem(
                         (chat.tg_id, "join"),
@@ -634,13 +651,13 @@ class Moderator:
                         keyboards.open_chat(chat.id),
                     )
                 else:
-                    logger.info("Заявка %s в «%s» не рассмотрена: %s", user.id, chat.title, error.message)
-                return False
+                    logger.info("Заявка %s в «%s» не рассмотрена: %s", user_id, chat.title, error.message)
+                return "error"
             except TelegramAPIError as error:
-                logger.info("Заявка %s в «%s» не рассмотрена: %s", user.id, chat.title, error)
-                return False
-            return True
-        return False
+                logger.info("Заявка %s в «%s» не рассмотрена: %s", user_id, chat.title, error)
+                return "error"
+            return "ok"
+        return "error"
 
     # ------------------------------------------------------------------ добавленные боты
 
