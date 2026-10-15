@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot import __version__
 from bot.app import App
 from bot.db.models import Campaign, Post, now_ts
 from bot.db.repo import JOIN_WAIT, DraftApplied, Target
@@ -1297,6 +1298,8 @@ async def settings_view(app: App, note: str | None = None) -> Screen:
         f"🕶 Скрытые админы во всех группах: {len(app.settings.trusted)}",
         "",
         "💾 Резервная копия — бот пришлёт файл базы данных со всеми чатами, рассылками и черновиками.",
+        "",
+        f"🔖 Версия бота: {__version__}",
     ]
     if note:
         lines += ["", note]

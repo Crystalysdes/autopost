@@ -238,3 +238,10 @@ async def test_max_length_setting(feed, dp, bot, app, session, moderator):
     await feed(press(Guard(a="maxlen_off")))
     assert app.settings.spam_max_len == 0
     assert (await app.repo.load_settings())["spam_max_len"] == "0"
+
+
+async def test_settings_show_bot_version(feed, app, session, moderator):
+    from bot import __version__
+
+    await feed(press(Nav(to="settings")))
+    assert f"🔖 Версия бота: {__version__}" in owner_texts(session)[-1]

@@ -17,6 +17,7 @@ from aiogram.types import User
 from aiogram.utils.token import TokenValidationError
 from pydantic import ValidationError
 
+from bot import __version__
 from bot.app import App, AppSettings
 from bot.config import Config
 from bot.db.base import Database
@@ -98,7 +99,9 @@ async def run(config: Config) -> None:
     scheduler_task = asyncio.create_task(app.scheduler.run())
     refresh_task = asyncio.create_task(refresh_all(app))
     admins = ", ".join(map(str, config.admin_ids))
-    logger.info("Бот @%s запущен. Админы: %s. Часовой пояс: %s", me.username, admins, settings.timezone)
+    logger.info(
+        "Бот @%s запущен. Версия %s. Админы: %s. Часовой пояс: %s", me.username, __version__, admins, settings.timezone
+    )
     try:
         # Апдейты, накопившиеся за время простоя, не сбрасываем: среди них могут быть
         # добавления бота в новые чаты.

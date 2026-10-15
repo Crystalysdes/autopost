@@ -404,6 +404,18 @@ docker compose up -d --build                                         # Docker (�
 передайте его на сервер (`scp autopost.zip root@IP_СЕРВЕРА:/root/`) и выполните команду `--update-zip`.
 Настройки (`.env`), база (`data/`) и окружение Python остаются как были.
 
+**С компьютера на Windows** всё делается в обычной командной строке (cmd), набирать команды на сервере не нужно.
+Подставьте адрес сервера и имя ветки:
+
+```
+curl -L -o "%USERPROFILE%\Downloads\autopost.zip" "https://github.com/Crystalysdes/autopost/archive/refs/heads/ВЕТКА.zip"
+scp "%USERPROFILE%\Downloads\autopost.zip" root@IP_СЕРВЕРА:/root/autopost.zip
+ssh root@IP_СЕРВЕРА "bash /opt/autopost/install.sh --update-zip /root/autopost.zip"
+```
+
+**Версия бота** видна в «⚙️ Настройки» («🔖 Версия бота: 11»), в журнале при запуске и в конце обновления.
+Если в архиве версия старше установленной (скачался прошлый архив), обновление откажется и ничего не тронет.
+
 Если на сервере версия без `--update-zip` (обновляетесь из архива впервые), сначала положите новые файлы
 вручную, потом запустите обычное обновление:
 

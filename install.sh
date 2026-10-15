@@ -346,8 +346,13 @@ update_code() {
 
 # Новая версия из ZIP-архива (например, скачанного с GitHub на компьютере и переданного через scp).
 # Настройки (.env), база (data/) и окружение Python (.venv) остаются прежними.
+# Версия бота в папке с кодом (bot/__init__.py); пусто — в этой версии номера ещё не было
+bot_version() {
+    sed -n 's/^__version__ = "\([0-9][0-9]*\)"$/\1/p' "$1/bot/__init__.py" 2>/dev/null | head -n 1
+}
+
 update_from_zip() {
-    local zip="$1" tmp main src
+    local zip="$1" tmp main src new_version old_version
     [ -f "$zip" ] || die "Архив не найден: $zip"
     find_python || die "Нужен Python 3.11 или новее."
     tmp="$(mktemp -d)"
@@ -367,6 +372,21 @@ PY
     if [ -z "$main" ] || [ ! -f "$src/install.sh" ] || [ ! -f "$src/requirements.txt" ]; then
         rm -rf "$tmp"
         die "В архиве нет бота автопостинга (bot/, install.sh, requirements.txt)."
+    fi
+    new_version="$(bot_version "$src")"
+    old_version="$(bot_version "$APP_DIR")"
+    if [ -n "$old_version" ] && [ -z "$new_version" ]; then  # номер версии есть во всех архивах с v11
+        rm -rf "$tmp"
+        die "В архиве старая версия бота (без номера), а установлена $old_version. Скачайте архив заново."
+    fi
+    if [ -n "$new_version" ] && [ -n "$old_version" ]; then
+        if [ "$new_version" -lt "$old_version" ]; then
+            rm -rf "$tmp"
+            die "В архиве версия $new_version, а установлена $old_version — это старый архив. Скачайте его заново."
+        fi
+        if [ "$new_version" -eq "$old_version" ]; then
+            info "Версия $new_version уже установлена — переустанавливаю."
+        fi
     fi
     rm -rf "$src/.env" "$src/data" "$src/.venv"
     info "Обновляю файлы бота (настройки .env и база data/ остаются как были)…"
@@ -390,9 +410,11 @@ check_foreign_unit() {
 }
 
 print_summary() {
-    local who="${BOT_USERNAME:+@$BOT_USERNAME}"
+    local who="${BOT_USERNAME:+@$BOT_USERNAME}" version
+    version="$(bot_version "$APP_DIR")"
     say ""
     say "${GREEN}${BOLD}✅ Готово!${RESET} Бот ${who:-автопостинга} работает как служба $SERVICE."
+    [ -z "$version" ] || say "Версия бота: ${BOLD}$version${RESET} (видна и в боте: «⚙️ Настройки»)."
     say ""
     say "Дальше: каждый админ открывает бота в Telegram и отправляет /start."
     say ""
