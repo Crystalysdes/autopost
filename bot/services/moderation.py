@@ -11,7 +11,8 @@
 4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
    с новыми личными ссылками-приглашениями на каналы.
 
-Заявки на вступление в группы и каналы бот принимает сам, если там включён автоприём.
+Заявки на вступление в группы и каналы бот принимает сам, если там включён автоприём, — от всех, кроме
+удалённых аккаунтов: их заявки отклоняет.
 """
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ from aiogram.exceptions import (
 from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message, User
 
 from bot.app import NO_PREVIEW, App
-from bot.db.models import Chat
-from bot.db.repo import JOIN_DECLINED, JOIN_REASON, JOIN_WAIT
+from bot.db.models import Chat, ModerationLog
+from bot.db.repo import JOIN_DECLINED, JOIN_REASON
 from bot.services import chats as chat_service
 from bot.services import spam, trusted
 from bot.services.errors import humanize
@@ -75,6 +76,8 @@ JOIN_ATTEMPTS = 3  # заявку при лимите Telegram пробуем п
 JOIN_RETRY_LIMIT = 300  # и ждём ради этого не дольше (каждая заявка обрабатывается отдельно)
 # Заявку уже рассмотрели (приняли вручную, человек отозвал её или уже в чате) — принимать нечего
 JOIN_ALREADY_DONE = ("hide_requester_missing", "user_already_participant", "already a member")
+DELETED_ACCOUNT_NAME = "deleted account"  # так удалённый аккаунт подписан в приложениях Telegram
+DELETED_NOTE = "удалённый аккаунт"  # пометка в журнале у отклонённой заявки
 
 _MISSING = object()
 
@@ -554,10 +557,11 @@ class Moderator:
         with contextlib.suppress(TelegramAPIError):
             await self.app.bot.delete_message(tg_id, message_id)
 
-    def _later(self, coro: Any) -> None:
+    def _later(self, coro: Any) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     async def close(self) -> None:
         """Остановка бота. Висящие подсказки убираем сразу: после перезапуска их уже никто не удалит."""
@@ -578,55 +582,82 @@ class Moderator:
 
     # ------------------------------------------------------------------ заявки на вступление
 
+    def start(self) -> asyncio.Task[None]:
+        """Фоновые дела при запуске бота (задачу можно дождаться; при остановке close() её отменит)."""
+        return self._later(self.approve_waiting())
+
     async def join_request(self, request: ChatJoinRequest) -> None:
-        """Заявка в группу или канал: если там включён автоприём — принять сразу. Подозрительную
-        (ссылка или стоп-слово в «о себе», реклама в имени) бот не принимает и не отклоняет: она остаётся
-        в обычном списке заявок Telegram, а в боте — в «🕵️ На проверке» с причиной.
+        """Заявка в группу или канал: если там включён автоприём — принять сразу, от кого угодно (ссылки
+        и реклама в имени или «о себе» не мешают). Отклоняются только заявки удалённых аккаунтов.
         Без автоприёма заявку рассмотрят админы чата, как обычно."""
         chat = await self.app.repo.get_chat_by_tg(request.chat.id)
         if chat is None or chat.status != "active" or not auto_approve_on(chat, self.app.settings.join_auto):
             return
         user = request.from_user
-        suspicion = self.join_suspicion(request, chat) if self.app.settings.join_filter else None
-        if suspicion:
-            logger.info("Автоприём: заявка %s в «%s» ждёт админа — %s", user.full_name, chat.title, suspicion)
-        elif await self._answer_join(chat, user.id, approve=True) != "ok":
+        deleted = is_deleted_account(user.first_name, user.last_name, user.username)
+        if await self._answer_join(chat, user.id, approve=not deleted) != "ok":
             return
+        if deleted:
+            logger.info("Автоприём: отклонена заявка удалённого аккаунта %s в «%s»", user.id, chat.title)
         else:
             logger.debug("Автоприём: %s принят в «%s»", user.full_name, chat.title)  # итоги — на экранах бота
-        name = f"{user.full_name} (@{user.username})" if user.username else user.full_name
+        name = user.full_name or str(user.id)
         await self.app.repo.log_moderation(
             chat.id,
             user_id=user.id,
-            user_name=name,
-            reason=JOIN_WAIT if suspicion else JOIN_REASON,
-            snippet=suspicion,
+            user_name=f"{name} (@{user.username})" if user.username else name,
+            reason=JOIN_DECLINED if deleted else JOIN_REASON,
+            snippet=DELETED_NOTE if deleted else None,
             now=int(self.wall()),
         )
 
-    def join_suspicion(self, request: ChatJoinRequest, chat: Chat) -> str | None:
-        """Почему заявку стоит проверить админу — с тем, что нашлось; None — всё в порядке."""
-        words = self.stop_words()
-        found = spam.ad_in_name(request.from_user.full_name, words)
-        if found:
-            return f"в имени: {found}"
-        allow = spam.build_allowlist(self.app.settings.spam_allow, [chat.username, self.app.bot_username])
-        found = spam.ad_in_bio(request.bio or "", words, allow)
-        return f"в «о себе»: {found}" if found else None
+    async def approve_waiting(self) -> None:
+        """Заявки, которые версии 10–11 оставляли админу («🕵️ На проверке»). Теперь бот принимает всех —
+        и их тоже, а удалённые с тех пор аккаунты отклоняет. Где автоприём выключен, заявку уже рассмотрели
+        или Telegram не дал на неё ответить, бот только забывает её: она остаётся админам в Telegram."""
+        try:
+            entries = await self.app.repo.waiting_joins()
+            done = {JOIN_REASON: 0, JOIN_DECLINED: 0}
+            for entry in entries:
+                reason = await self._settle_waiting(entry)
+                await self.app.repo.set_moderation_reason(entry.id, reason)
+                if reason is not None:
+                    done[reason] += 1
+            if entries:
+                logger.info(
+                    "Автоприём: заявки, ждавшие проверки, разобраны — принято %s, отклонено удалённых аккаунтов %s, "
+                    "оставлено админам %s",
+                    done[JOIN_REASON],
+                    done[JOIN_DECLINED],
+                    len(entries) - sum(done.values()),
+                )
+        except Exception:
+            logger.exception("Не удалось разобрать заявки, ждавшие проверки")
 
-    async def decide_join(self, entry_id: int, *, approve: bool) -> str:
-        """Решение админа по заявке из «🕵️ На проверке»: ok — сделано, gone — заявку уже рассмотрели
-        (в Telegram или раньше), error — не вышло сейчас (нет прав, лимит, связь)."""
-        entry = await self.app.repo.get_moderation(entry_id)
-        chat = await self.app.repo.get_chat(entry.chat_id) if entry else None
-        if entry is None or entry.reason != JOIN_WAIT or chat is None or entry.user_id is None:
-            return "gone"
-        result = await self._answer_join(chat, entry.user_id, approve=approve)
-        if result == "ok":
-            await self.app.repo.set_moderation_reason(entry.id, JOIN_REASON if approve else JOIN_DECLINED)
-        elif result == "gone":
-            await self.app.repo.set_moderation_reason(entry.id, None)
-        return result
+    async def _settle_waiting(self, entry: ModerationLog) -> str | None:
+        """Ответить на отложенную заявку: JOIN_REASON — принята, JOIN_DECLINED — отклонена (аккаунт удалён),
+        None — бот её не решает (её решат или уже решили админы в Telegram)."""
+        chat = await self.app.repo.get_chat(entry.chat_id)
+        if (
+            chat is None
+            or chat.status != "active"
+            or entry.user_id is None
+            or not auto_approve_on(chat, self.app.settings.join_auto)
+        ):
+            return None
+        deleted = await self._deleted_now(entry.user_id)
+        if await self._answer_join(chat, entry.user_id, approve=not deleted) != "ok":
+            return None
+        return JOIN_DECLINED if deleted else JOIN_REASON
+
+    async def _deleted_now(self, user_id: int) -> bool:
+        """Удалён ли аккаунт сейчас: заявку подали давно, с тех пор аккаунт могли удалить.
+        Если Telegram о человеке не рассказал, считаем аккаунт живым."""
+        try:
+            info = await self.app.bot.get_chat(user_id)
+        except TelegramAPIError:
+            return False
+        return info.type == "private" and is_deleted_account(info.first_name, info.last_name, info.username)
 
     async def _answer_join(self, chat: Chat, user_id: int, *, approve: bool) -> str:
         """Принять или отклонить заявку: ok, gone (её уже рассмотрели) или error (нет прав, лимит, связь)."""
@@ -775,6 +806,15 @@ def invite_name(full_name: str, user_id: int) -> str:
         room -= size
     name = name.strip()
     return name + suffix if name else str(user_id)
+
+
+def is_deleted_account(first_name: str | None, last_name: str | None = None, username: str | None = None) -> bool:
+    """Удалённый аккаунт: Telegram отдаёт его ботам без имени, фамилии и ника, а в приложениях подписывает
+    «Deleted Account». Это имя без фамилии и ника тоже считаем удалённым аккаунтом."""
+    if last_name or username:
+        return False
+    name = (first_name or "").strip()
+    return not name or name.casefold() == DELETED_ACCOUNT_NAME
 
 
 def auto_approve_on(chat: Chat, default: bool) -> bool:

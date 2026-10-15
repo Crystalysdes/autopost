@@ -42,8 +42,8 @@ NAME_LIMIT = 64
 GROUP_TYPES = ("group", "supergroup")
 MODERATION_KEEP_SECONDS = 14 * 24 * 3600  # журнал удалённого защитой хранится две недели
 JOIN_REASON = "join"  # в том же журнале — заявки на вступление, которые бот принял сам
-JOIN_DECLINED = "join_no"  # отклонил (кнопкой админа в боте)
-JOIN_WAIT = "join_wait"  # подозрительные: бот их не принял сам, ждут решения админа
+JOIN_DECLINED = "join_no"  # отклонил: удалённый аккаунт (в версиях 10–11 — и админ кнопкой в боте)
+JOIN_WAIT = "join_wait"  # версии 10–11 оставляли такие заявки админу; при запуске бот их принимает
 JOIN_REASONS = (JOIN_REASON, JOIN_DECLINED, JOIN_WAIT)
 
 
@@ -387,7 +387,8 @@ class Repo:
         return sum(counts.values()), sub
 
     async def join_counts(self, since_ts: int, chat_id: int | None = None, reason: str = JOIN_REASON) -> int:
-        """Сколько заявок на вступление бот принял (или отклонил — reason=JOIN_DECLINED) начиная с since_ts."""
+        """Сколько заявок на вступление бот принял (или отклонил удалённых аккаунтов — reason=JOIN_DECLINED)
+        начиная с since_ts."""
         async with self.db.session() as s:
             query = select(func.count(ModerationLog.id)).where(
                 ModerationLog.reason == reason, ModerationLog.ts >= since_ts
@@ -396,23 +397,18 @@ class Repo:
                 query = query.where(ModerationLog.chat_id == chat_id)
             return int(await s.scalar(query) or 0)
 
-    async def waiting_joins(self, since_ts: int, limit: int = 20) -> list[ModerationLog]:
-        """Подозрительные заявки, которые ждут решения админа, — новые первыми."""
+    async def waiting_joins(self) -> list[ModerationLog]:
+        """Заявки, которые версии 10–11 оставили админу («На проверке»), — старые первыми."""
         async with self.db.session() as s:
             rows = await s.scalars(
                 select(ModerationLog)
-                .where(ModerationLog.reason == JOIN_WAIT, ModerationLog.ts >= since_ts)
-                .order_by(ModerationLog.ts.desc(), ModerationLog.id.desc())
-                .limit(limit)
+                .where(ModerationLog.reason == JOIN_WAIT)
+                .order_by(ModerationLog.ts, ModerationLog.id)
             )
             return list(rows.all())
 
-    async def get_moderation(self, entry_id: int) -> ModerationLog | None:
-        async with self.db.session() as s:
-            return await s.get(ModerationLog, entry_id)
-
     async def set_moderation_reason(self, entry_id: int, reason: str | None) -> None:
-        """Сменить итог записи журнала; None — удалить запись (например, заявку уже рассмотрели в Telegram)."""
+        """Сменить итог записи журнала; None — удалить запись (например, заявку решают админы в Telegram)."""
         async with self.db.session() as s:
             entry = await s.get(ModerationLog, entry_id)
             if entry is None:

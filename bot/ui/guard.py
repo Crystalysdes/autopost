@@ -8,18 +8,16 @@ from aiogram.types import InlineKeyboardButton
 
 from bot.app import App
 from bot.db.models import Chat, now_ts
-from bot.db.repo import JOIN_DECLINED, JOIN_WAIT
+from bot.db.repo import JOIN_DECLINED
 from bot.services import spam, trusted
 from bot.services.moderation import GROUP_TYPES, auto_approve_on, required_channels
 from bot.ui import texts as t
 from bot.ui.callbacks import Guard, Nav
-from bot.ui.keyboards import BLUE, GREEN, RED, btn, markup
+from bot.ui.keyboards import GREEN, RED, btn, markup
 from bot.ui.render import Screen
 
 MAX_CHANNELS = 40
 MAX_JOIN_CHATS = 40  # галочек на экране автоприёма; остальные чаты — на их экранах
-WAITING_LIMIT = 15  # заявок на экране «🕵️ На проверке»
-WAITING_DAYS = 7  # старше — скорее всего, уже рассмотрены в Telegram
 MAX_TRUSTED_BUTTONS = 40  # кнопок «❌» на экране скрытых админов
 MAX_TARGET_GROUPS = 40  # групп на экране «Куда добавить?»
 LOG_LIMIT = 10
@@ -316,28 +314,22 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
     today_start, week_start = t.day_start_ts(app.settings.tz, now), now - 7 * 24 * 3600
     today = await app.repo.join_counts(today_start)
     week = await app.repo.join_counts(week_start)
-    waiting_today = await app.repo.join_counts(today_start, reason=JOIN_WAIT)
-    waiting = len(await app.repo.waiting_joins(now - WAITING_DAYS * 24 * 3600, limit=1000))
     declined_week = await app.repo.join_counts(week_start, reason=JOIN_DECLINED)
-    filter_on = app.settings.join_filter
     lines = [
         "<b>🚪 Автоприём заявок</b>",
         "",
-        "Бот сам принимает заявки на вступление в отмеченные группы и каналы. Заявки бывают, где включено "
-        "«Одобрение новых участников» или раздаются ссылки с заявками, — в остальных чатах люди вступают сразу.",
+        "Бот сам принимает все заявки на вступление в отмеченные группы и каналы — кроме удалённых аккаунтов: "
+        "их заявки он отклоняет. Заявки бывают, где включено «Одобрение новых участников» или раздаются ссылки "
+        "с заявками, — в остальных чатах люди вступают сразу.",
         "",
         f"Telegram присылает боту заявки, только если у него есть право приглашать: в группе — "
         f"{t.GROUP_INVITE_RIGHT}, в канале — {t.INVITE_RIGHT}.",
         "",
         f"Включён: <b>{len(enabled)}</b> из {len(chats)}",
         "Новые чаты: " + ("✅ автоприём включается сам" if default else "⏸ без автоприёма"),
-        "🤖 Подозрительные заявки (ссылка или стоп-слово в «о себе», реклама в имени): "
-        + ("✅ бот их не принимает — они ждут вас" if filter_on else "⏸ не проверяются — принимаются все"),
-        f"📊 Сегодня: принято {today}, на проверку {waiting_today} · за 7 дней: принято {week}"
-        + (f", отклонено вами {declined_week}" if declined_week else ""),
+        f"📊 Сегодня: принято {today} · за 7 дней: принято {week}"
+        + (f", отклонено удалённых аккаунтов: {declined_week}" if declined_week else ""),
     ]
-    if waiting:
-        lines += ["", f"🕵️ Ждут вашего решения: <b>{waiting}</b> — кнопка «🕵️ На проверке» ниже или в Telegram."]
     if no_right:
         names = t.names_label([c.title for c in no_right], 5, 30)
         lines += ["", f"⚠️ Нет права приглашать — заявки не приходят боту: {names}"]
@@ -364,49 +356,7 @@ async def joins_view(app: App, note: str | None = None) -> Screen:
             btn("⏸ Выключить во всех", Guard(a="jall", v=0), RED),
         ]
     )
-    rows.append(
-        [
-            btn("🤖 Проверять подозрительных: ✅", Guard(a="jfilter", v=0))
-            if filter_on
-            else btn("🤖 Проверять подозрительных: ⏸", Guard(a="jfilter", v=1), GREEN)
-        ]
-    )
-    if waiting:
-        rows.append([btn(f"🕵️ На проверке ({waiting})", Guard(a="jwait"), BLUE)])
     rows.append([btn("« Настройки", Nav(to="settings"))])
-    return "\n".join(lines), markup(*rows)
-
-
-async def waiting_joins_view(app: App, note: str | None = None) -> Screen:
-    """Подозрительные заявки, которые бот не принял сам: кто, куда, почему — и решение админа."""
-    now = _now(app)
-    entries = await app.repo.waiting_joins(now - WAITING_DAYS * 24 * 3600, limit=WAITING_LIMIT)
-    titles = {chat.id: chat.title for chat in await app.repo.list_chats()}
-    lines = [
-        "<b>🕵️ Заявки на проверке</b>",
-        "",
-        "Эти заявки бот не принял сам: в имени или «о себе» нашлась ссылка или стоп-слово. Они ждут в обычном "
-        "списке заявок Telegram — решить можно там или здесь.",
-        "",
-    ]
-    if not entries:
-        lines.append("Сейчас таких заявок нет.")
-    for entry in entries:
-        where = t.esc(titles.get(entry.chat_id, "чат удалён"), 30)
-        who = t.esc(entry.user_name or str(entry.user_id), 40)
-        lines.append(f"• {t.fmt_ts(entry.ts, app.settings.tz, now)} · {who} → «{where}»")
-        if entry.snippet:
-            lines.append(f"  <i>{t.esc(entry.snippet, 100)}</i>")
-    if note:
-        lines += ["", note]
-    rows: list[list[InlineKeyboardButton] | None] = [
-        [
-            btn(f"✅ {t.cut(entry.user_name or str(entry.user_id), 28)}", Guard(a="jok", id=entry.id), GREEN),
-            btn("❌ Отклонить", Guard(a="jno", id=entry.id), RED),
-        ]
-        for entry in entries
-    ]
-    rows.append([btn("« Автоприём заявок", Guard(a="joins"))])
     return "\n".join(lines), markup(*rows)
 
 

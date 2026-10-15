@@ -10,14 +10,15 @@ from datetime import datetime
 
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import AnswerCallbackQuery, ApproveChatJoinRequest, DeclineChatJoinRequest, SendMessage
+from aiogram.methods import AnswerCallbackQuery, ApproveChatJoinRequest, DeclineChatJoinRequest, GetChat, SendMessage
 from aiogram.types import Chat, ChatJoinRequest, Update, User
 
+from bot.db.repo import JOIN_DECLINED, JOIN_WAIT
 from bot.services import moderation as moderation_module
-from bot.services.moderation import Moderator
+from bot.services.moderation import Moderator, is_deleted_account
 from bot.ui import keyboards
 from bot.ui.callbacks import Guard, Nav
-from tests.conftest import OWNER_ID, STRANGER_ID, admin_member
+from tests.conftest import OWNER_ID, STRANGER_ID, admin_member, chat_info
 from tests.test_flows import (  # noqa: F401
     add_chat,
     button_data,
@@ -173,82 +174,99 @@ async def test_missing_right_is_reported_once_a_day(feed, app, session, moderato
     assert await app.repo.join_counts(0) == 0
 
 
-# ------------------------------------------------------------------------ подозрительные заявки
+# ------------------------------------------------------------------------ все, кроме удалённых аккаунтов
 
 
 SPAMMER = User(id=5100, is_bot=False, first_name="Заработок", last_name="в лс")
+DELETED = User(id=5200, is_bot=False, first_name="")  # так Telegram отдаёт ботам удалённый аккаунт
 
 
-async def test_suspicious_requests_wait_for_admin(feed, app, session, moderator):
+async def test_everyone_is_approved_whatever_is_in_the_profile(feed, app, session, moderator):
     group = await add_with_invite(feed, app, GROUP)
     session.clear()
     promoter = User(id=5101, is_bot=False, first_name="Анна", username="anna_design")
-    blogger = User(id=5103, is_bot=False, first_name="Олег")
     await feed(
         join_request(GROUP, user=SPAMMER),  # реклама в имени
         join_request(GROUP, user=promoter, bio="Портфолио: behance.net/anna"),  # ссылка в «о себе»
-        join_request(GROUP, user=blogger, bio="Мой канал @oleg_blog"),  # @канал — это нормально
-        join_request(GROUP, user=User(id=5102, is_bot=False, first_name="Катя"), bio="Люблю котов"),
+        join_request(GROUP, user=User(id=5102, is_bot=False, first_name="Катя"), bio="Пассивный доход, пишите в лс"),
     )
-    assert declined(session) == []  # бот никого не отклоняет
-    assert approved(session) == [(GROUP, blogger.id), (GROUP, 5102)]  # подозрительных не принял — ждут админа
-    assert await app.repo.join_counts(0) == 2
-    assert await app.repo.join_counts(0, reason="join_wait") == 2
-    assert await app.repo.moderation_counts(0) == (0, 0)  # не удалённый спам
-    assert await app.repo.last_moderation(group.id) == []  # и не «Последние удалённые»
+    assert approved(session) == [(GROUP, SPAMMER.id), (GROUP, promoter.id), (GROUP, 5102)]
+    assert declined(session) == []
+    assert await app.repo.join_counts(0, group.id) == 3
 
-    await feed(press(Nav(to="main")))
-    assert "Сегодня принято заявок: 2 · на проверке: 2" in owner_texts(session)[-1]
     await feed(press(Guard(a="joins")))
-    assert "Ждут вашего решения: <b>2</b>" in owner_texts(session)[-1]
-    await feed(press(Guard(a="jwait")))
-    text = owner_texts(session)[-1]
-    assert "Анна (@anna_design)" in text and "в «о себе»: behance.net/anna" in text
-    assert "в имени: заработок" in text
-
-    entries = {entry.user_id: entry for entry in await app.repo.waiting_joins(0)}
-    await feed(press(Guard(a="jok", id=entries[promoter.id].id)))
-    assert (GROUP, promoter.id) in approved(session)
-    assert session.calls(AnswerCallbackQuery)[-1].text == "✅ Заявка принята"
-    await feed(press(Guard(a="jno", id=entries[SPAMMER.id].id)))
-    assert declined(session) == [(GROUP, SPAMMER.id)]
-    assert await app.repo.waiting_joins(0) == []
-    assert await app.repo.join_counts(0) == 3 and await app.repo.join_counts(0, reason="join_no") == 1
-
-    await feed(press(Guard(a="jok", id=entries[promoter.id].id)))  # повторное нажатие
-    assert "уже рассмотрели" in session.calls(AnswerCallbackQuery)[-1].text
+    assert "кроме удалённых аккаунтов" in owner_texts(session)[-1]
+    actions = {Guard.unpack(data).a for data in button_data(last_markup(session)) if data.startswith("m:")}
+    assert actions == {"jn", "jall"}  # проверять нечего — ни кнопки проверки, ни «На проверке»
 
 
-async def test_request_handled_in_telegram_leaves_the_list(feed, app, session, moderator):
+async def test_deleted_accounts_are_declined(feed, app, session, moderator):
     await add_with_invite(feed, app, GROUP)
-    await feed(join_request(GROUP, user=SPAMMER))
-    (entry,) = await app.repo.waiting_joins(0)
-    session.queue(ApproveChatJoinRequest, refusal("Bad Request: HIDE_REQUESTER_MISSING"))  # админ уже решил сам
-    await feed(press(Guard(a="jok", id=entry.id)))
-    assert "уже рассмотрели" in session.calls(AnswerCallbackQuery)[-1].text
-    assert await app.repo.waiting_joins(0) == []
-
-
-async def test_filter_can_be_switched_off(feed, app, session, moderator):
-    await add_with_invite(feed, app, GROUP)
-    await feed(press(Guard(a="joins")))
-    assert "✅ бот их не принимает — они ждут вас" in owner_texts(session)[-1]
-    await feed(press(Guard(a="jfilter", v=0)))
-    assert app.settings.join_filter is False
-    assert "⏸ не проверяются" in owner_texts(session)[-1]
     session.clear()
-    await feed(join_request(GROUP, user=SPAMMER))
-    assert approved(session) == [(GROUP, SPAMMER.id)] and declined(session) == []
+    ghost = User(id=5201, is_bot=False, first_name="Deleted Account")
+    await feed(join_request(GROUP, user=DELETED), join_request(GROUP, user=ghost), join_request(GROUP))
+    assert declined(session) == [(GROUP, DELETED.id), (GROUP, ghost.id)]
+    assert approved(session) == [(GROUP, PERSON.id)]
+    assert await app.repo.join_counts(0) == 1
+    assert await app.repo.join_counts(0, reason=JOIN_DECLINED) == 2
+    assert await app.repo.moderation_counts(0) == (0, 0)  # не удалённый спам
 
-    await feed(press(Guard(a="jfilter", v=1)))
-    assert (await app.repo.load_settings())["join_filter"] == "1"
+    await feed(press(Guard(a="joins")))
+    assert "за 7 дней: принято 1, отклонено удалённых аккаунтов: 2" in owner_texts(session)[-1]
 
 
-async def test_without_auto_approve_suspicious_requests_wait_for_admins(feed, app, session, moderator):
+async def test_without_auto_approve_deleted_accounts_are_left_to_admins(feed, app, session, moderator):
     group = await add_with_invite(feed, app, GROUP)
     await feed(press(Guard(a="jchat", id=group.id, v=0)))
     session.clear()
-    await feed(join_request(GROUP, user=SPAMMER))
+    await feed(join_request(GROUP, user=DELETED))
+    assert approved(session) == [] and declined(session) == []
+
+
+def test_deleted_account_signs():
+    assert is_deleted_account("") and is_deleted_account(None) and is_deleted_account("  ")
+    assert is_deleted_account("Deleted Account") and is_deleted_account("deleted account")
+    assert not is_deleted_account("Анна")
+    assert not is_deleted_account("Deleted Account", username="real_person")  # живой человек с таким именем
+    assert not is_deleted_account("Deleted Account", last_name="Smith")
+
+
+async def test_requests_left_for_review_are_settled_on_start(feed, app, session, moderator):
+    """Версии 10–11 оставляли «подозрительные» заявки админу — новая версия при запуске принимает их сама."""
+    group = await add_with_invite(feed, app, GROUP)
+    manual = await add_with_invite(feed, app, OTHER)
+    await feed(press(Guard(a="jchat", id=manual.id, v=0)))  # здесь заявки решают админы
+    alive, ghost, handled, elsewhere = 5301, 5302, 5303, 5304
+    waiting = [(group, alive), (group, ghost), (group, handled), (manual, elsewhere)]
+    for n, (chat, user_id) in enumerate(waiting):
+        await app.repo.log_moderation(
+            chat.id, user_id=user_id, user_name=f"U{user_id}", reason=JOIN_WAIT, snippet="в имени: x", now=1000 + n
+        )
+    session.handlers[GetChat] = lambda method: chat_info(  # с тех пор аккаунт ghost удалили
+        int(method.chat_id), title=None, chat_type="private", first_name="" if method.chat_id == ghost else "Живой"
+    )
+    session.queue(ApproveChatJoinRequest, True)  # alive
+    session.queue(ApproveChatJoinRequest, refusal("Bad Request: HIDE_REQUESTER_MISSING"))  # handled: уже решили
+    session.clear()
+
+    await moderator.start()
+    assert approved(session) == [(GROUP, alive), (GROUP, handled)]
+    assert declined(session) == [(GROUP, ghost)]
+    assert [int(call.chat_id) for call in session.calls(GetChat)] == [alive, ghost, handled]  # elsewhere не трогали
+    assert await app.repo.waiting_joins() == []
+    assert await app.repo.join_counts(0) == 1
+    assert await app.repo.join_counts(0, reason=JOIN_DECLINED) == 1
+
+    await moderator.approve_waiting()  # следующий запуск — разбирать уже нечего
+    assert len(session.calls(GetChat)) == 3
+
+
+async def test_old_review_buttons_are_stale(feed, app, session, moderator):
+    """Кнопки «На проверке» и «Проверять подозрительных» в старых сообщениях бота больше ничего не делают."""
+    await add_with_invite(feed, app, GROUP)
+    for old in (Guard(a="jwait"), Guard(a="jok", id=1), Guard(a="jno", id=1), Guard(a="jfilter", v=1)):
+        await feed(press(old))
+        assert "Кнопка устарела" in session.calls(AnswerCallbackQuery)[-1].text
     assert approved(session) == [] and declined(session) == []
 
 
@@ -300,7 +318,7 @@ async def test_accepted_requests_are_counted_on_screens(feed, app, session, mode
     assert "✅ приглашения" in owner_texts(session)[-1]
     assert "сегодня принято 1" in owner_texts(session)[-1]
     await feed(press(Guard(a="joins")))
-    assert "Сегодня: принято 1, на проверку 0 · за 7 дней: принято 1" in owner_texts(session)[-1]
+    assert "Сегодня: принято 1 · за 7 дней: принято 1" in owner_texts(session)[-1]
 
 
 # ------------------------------------------------------------------------ прочее

@@ -328,38 +328,6 @@ async def toggle_join(callback: CallbackQuery, callback_data: Guard, app: App, c
         await show(app, callback, await guard.joins_view(app))
 
 
-@router.callback_query(Guard.filter(F.a == "jfilter"))
-async def toggle_join_filter(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
-    on = bool(callback_data.v)
-    await app.settings.set(app.repo, "join_filter", on)
-    note = (
-        "🤖 Подозрительные заявки бот не принимает сам — они ждут вас"
-        if on
-        else "⏸ Подозрительные заявки больше не проверяются — принимаются все"
-    )
-    await show(app, callback, await guard.joins_view(app, note))
-
-
-@router.callback_query(Guard.filter(F.a == "jwait"))
-async def open_waiting_joins(callback: CallbackQuery, app: App) -> None:
-    await show(app, callback, await guard.waiting_joins_view(app))
-
-
-@router.callback_query(Guard.filter(F.a.in_({"jok", "jno"})))
-async def decide_join(callback: CallbackQuery, callback_data: Guard, app: App, callback_answer: CallbackAnswer) -> None:
-    approve = callback_data.a == "jok"
-    result = await app.moderator.decide_join(callback_data.id, approve=approve) if app.moderator else "error"
-    if result == "ok":
-        note = "✅ Заявка принята" if approve else "❌ Заявка отклонена"
-    elif result == "gone":
-        note = "Эту заявку уже рассмотрели — в Telegram или раньше"
-    else:
-        note = "⚠️ Не получилось — проверьте у бота право приглашать и попробуйте ещё раз"
-        callback_answer.show_alert = True
-    callback_answer.text = note
-    await show(app, callback, await guard.waiting_joins_view(app))
-
-
 @router.callback_query(Guard.filter(F.a == "jall"))
 async def join_everywhere(callback: CallbackQuery, callback_data: Guard, app: App) -> None:
     """Общая настройка — для всех чатов и для новых; выбранное отдельно для чатов сбрасывается."""

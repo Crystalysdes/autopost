@@ -227,22 +227,6 @@ def ad_in_name(name: str, stop_words: Sequence[tuple[re.Pattern[str], re.Pattern
     return stop_word_in(name, stop_words)
 
 
-def ad_in_bio(
-    text: str,
-    stop_words: Sequence[tuple[re.Pattern[str], re.Pattern[str]]],
-    allow: Allowlist | None = None,
-) -> str | None:
-    """Реклама в «о себе» — что нашлось: ссылка или стоп-слово. @упоминания не в счёт: у многих людей
-    там свой канал. Разрешённые ссылки (свой сайт, свой канал) не считаются."""
-    if not text:
-        return None
-    allow = allow or Allowlist()
-    for link in find_links(text):
-        if not allow.allows_url(link):
-            return link
-    return stop_word_in(text, stop_words)
-
-
 def find_links(text: str) -> list[str]:
     """Ссылки в тексте, которые Telegram мог не распознать: без схемы, с пробелами, «t . me/…»."""
     found = []

@@ -14,7 +14,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from bot import __version__
 from bot.app import App
 from bot.db.models import Campaign, Post, now_ts
-from bot.db.repo import JOIN_WAIT, DraftApplied, Target
+from bot.db.repo import DraftApplied, Target
 from bot.services import schedule_utils as su
 from bot.services.buttons import buttons_to_html, count_buttons, has_icons
 from bot.services.campaigns import target_problem
@@ -140,10 +140,8 @@ async def main_menu(app: App) -> Screen:
     if spam_today or sub_today:
         lines.append(f"🛡 Сегодня удалено: спам {spam_today} · без подписки {sub_today}")
     joined_today = await app.repo.join_counts(t.day_start_ts(tz, now))
-    waiting_today = await app.repo.join_counts(t.day_start_ts(tz, now), reason=JOIN_WAIT)
-    if joined_today or waiting_today:
-        line = f"🚪 Сегодня принято заявок: {joined_today}"
-        lines.append(line + (f" · на проверке: {waiting_today}" if waiting_today else ""))
+    if joined_today:
+        lines.append(f"🚪 Сегодня принято заявок: {joined_today}")
     if upcoming and not app.settings.paused_all:
         campaign = upcoming[0]
         lines.append(f"⏭ Следующая: {t.fmt_ts(campaign.next_run_ts, tz, now)} · «{t.esc(campaign.name, 30)}»")
@@ -1383,11 +1381,10 @@ def help_view() -> Screen:
         "«✅ Проверить подписку». Правила чата — «🛡 Защита» на экране чата. Скрытые админы (кнопка внизу "
         "экрана или «⚙️ Настройки → 🕶 Скрытые админы») пишут без проверок, как админы чата. Боту нужно право "
         f"«Удаление сообщений», а в каналах для подписки он должен быть админом с правом {t.INVITE_RIGHT}.\n\n"
-        "<b>5. Автоприём заявок.</b> Бот сам принимает заявки на вступление в группы и каналы — везде, где они "
-        "есть; подозрительные (ссылка или стоп-слово в «о себе», реклама в имени) оставляет вам — "
-        "они в «🕵️ На проверке». Выключить автоприём можно галочками в «⚙️ Настройки → "
-        "🚪 Автоприём заявок» или на экране чата. Боту нужно право приглашать: без него Telegram не присылает "
-        "ему заявки.\n\n"
+        "<b>5. Автоприём заявок.</b> Бот сам принимает все заявки на вступление в группы и каналы — везде, "
+        "где они есть, кроме удалённых аккаунтов: их заявки отклоняет. Выключить автоприём можно галочками "
+        "в «⚙️ Настройки → 🚪 Автоприём заявок» или на экране чата. Боту нужно право приглашать: без него "
+        "Telegram не присылает ему заявки.\n\n"
         "<b>6. Команды в группах</b> — ответом на сообщение нарушителя: /del — удалить, /mute и /ban — замутить "
         "и забанить (навсегда или на срок: <code>/mute 1h</code>, <code>/ban 1day</code>), /delmute и /delban — "
         "удалить и наказать, /unmute и /unban — снять. Команда сразу исчезает, в чате не остаётся следов. "

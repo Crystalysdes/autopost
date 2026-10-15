@@ -92,6 +92,7 @@ async def run(config: Config) -> None:
     )
     app.scheduler = Scheduler(app)
     app.moderator = Moderator(app)
+    app.moderator.start()  # в фоне: заявки, которые прошлые версии оставили «на проверке»
     dp = build_dispatcher(app)
     app.commands_ready = await setup_commands(bot, config.admin_ids)
 
