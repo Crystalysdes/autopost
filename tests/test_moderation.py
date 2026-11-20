@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import time
 from datetime import datetime, timedelta
@@ -499,6 +500,23 @@ async def test_notice_disappears_when_member_subscribes_and_writes(feed, app, se
     await feed(kept)
     assert kept.message.message_id not in deleted(session)
     assert 9001 in deleted(session)  # подсказка исчезла
+
+
+async def test_notice_hangs_ten_minutes(feed, app, session):
+    moderator = Moderator(app)  # срок подсказки — как в работе, без подмены из фикстуры
+    app.moderator = moderator
+    await setup_subscription(feed, app, moderator)
+    session.handlers[GetChatMember] = member_handler(set())
+    delays: list[float] = []
+
+    def remember(tg_id: int, message_id: int, delay: float):
+        delays.append(delay)
+        return asyncio.sleep(0)
+
+    moderator._delete_quietly = remember
+    await feed(group_msg(text="Привет"))
+    assert len(group_sends(session)) == 1  # подсказка показана
+    assert delays == [10 * 60]  # и уберётся через 10 минут
 
 
 async def test_live_notices_are_removed_on_shutdown(feed, app, session, moderator):
