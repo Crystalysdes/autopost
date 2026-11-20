@@ -192,6 +192,77 @@ async def test_linked_channel_posts_are_kept(feed, app, session, moderator):
     assert deleted(session) == [spam.message.message_id]
 
 
+# ---------------------------------------------------------------------- комментарии под постами канала
+
+
+def channel_post(message_id: int) -> Message:
+    """Пост канала в группе обсуждения (автопересылка) — корень ветки комментариев."""
+    channel = Chat(id=CHANNEL, type="channel", title="Наш канал")
+    return Message(
+        message_id=message_id,
+        date=datetime.now(),
+        chat=Chat(id=GROUP, type="supergroup", title="Группа"),
+        from_user=User(id=777000, is_bot=False, first_name="Telegram"),
+        sender_chat=channel,
+        is_automatic_forward=True,
+        forward_origin={"type": "channel", "date": datetime.now(), "chat": channel, "message_id": 5},
+        text="Пост",
+    )
+
+
+def seen_before(message_id: int, **fields: Any) -> Message:
+    """Сообщение группы, вышедшее до запуска бота: бот его не видел, оно известно только из ответа."""
+    chat = Chat(id=GROUP, type="supergroup", title="Группа")
+    return Message(message_id=message_id, date=datetime.now(), chat=chat, from_user=MEMBER, **fields)
+
+
+def in_thread(root: int, reply: Message, **fields: Any) -> Update:
+    """Сообщение в ветке root, ответ на reply — так ответы присылает Telegram."""
+    return group_msg(reply_to_message=reply, message_thread_id=root, **fields)
+
+
+async def test_comments_under_channel_posts_are_not_touched(feed, app, session, moderator):
+    await setup_subscription(feed, app, moderator)  # писать в группе могут только подписчики канала
+    session.handlers[GetChatMember] = member_handler(set())  # а подписчиков нет
+    post = channel_post(next(_ids))
+    await feed(Update(update_id=next(_ids), message=post))
+    session.clear()
+
+    comment = in_thread(post.message_id, post, text="Отличный пост, мой сайт spam.site")
+    answer = in_thread(post.message_id, comment.message, text="Согласен, заходите в @spam_offers_bot")
+    edit = in_thread(post.message_id, post, update="edited_message", text="Ещё ссылка: t.me/+spam")
+    await feed(comment, answer, edit)
+    assert deleted(session) == [] and group_sends(session) == []  # ни удалений, ни подсказок
+
+    # в самом чате группы обсуждения защита работает как раньше
+    plain = group_msg(text="Привет")
+    reply = in_thread(plain.message.message_id, plain.message, text="Это ответ")
+    deeper = in_thread(plain.message.message_id, reply.message, text="И ещё ответ")
+    await feed(plain, reply, deeper)
+    assert {u.message.message_id for u in (plain, reply, deeper)} <= set(deleted(session))  # нет подписки
+
+
+async def test_comments_on_posts_from_before_start(feed, app, session, moderator):
+    """Посты вышли, пока бота не было, — бот их не видел. Комментарий к посту он узнаёт по ответу на пост,
+    а ответы внутри незнакомых старых веток в группе обсуждения тоже не трогает."""
+    await setup_group(feed, app)
+    session.handlers[GetChat] = lambda method: chat_info(int(method.chat_id), linked_chat_id=CHANNEL)
+    first = in_thread(5, channel_post(5), text="Комментарий к старому посту: spam.site")
+    known = in_thread(5, seen_before(6, text="Старый комментарий", message_thread_id=5), text="Ответ: spam.site")
+    unknown = in_thread(8, seen_before(9, text="Другой комментарий", message_thread_id=8), text="Ответ: spam.site")
+    old_plain = seen_before(7, text="Старое сообщение в чате")
+    main_reply = in_thread(7, old_plain, text="Ответ в чате: spam.site")  # ответ прямо на обычное сообщение
+    await feed(first, known, unknown, main_reply)
+    assert deleted(session) == [main_reply.message.message_id]
+
+
+async def test_old_reply_threads_in_ordinary_group_are_checked(feed, app, session, moderator):
+    await setup_group(feed, app)  # обычная группа: к каналу не привязана
+    reply = in_thread(8, seen_before(9, text="Старый ответ", message_thread_id=8), text="spam.site")
+    await feed(reply)
+    assert deleted(session) == [reply.message.message_id]
+
+
 async def test_antispam_can_be_turned_off_in_chat(feed, app, session, moderator):
     chat = await setup_group(feed, app)
     await app.repo.update_chat(chat.id, spam_filter={"on": False})

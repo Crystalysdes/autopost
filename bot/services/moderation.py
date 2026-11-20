@@ -5,10 +5,10 @@
 
 Порядок для каждого сообщения:
 1. служебные сообщения: вход/выход удаляются (если включено), остальные не трогаются;
-2. сразу пропускаются админы бота, скрытые админы (bot/services/trusted.py), анонимные админы чата
-   и посты привязанного канала;
-3. антиспам: если сообщение похоже на спам и автор не админ чата — молча удалить;
-4. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
+2. посты привязанного канала в группе обсуждения и комментарии под ними не проверяются (см. _is_comment);
+3. сразу пропускаются админы бота, скрытые админы (bot/services/trusted.py) и анонимные админы чата;
+4. антиспам: если сообщение похоже на спам и автор не админ чата — молча удалить;
+5. подписка: если человек не подписан на нужные каналы и не админ чата — удалить и показать подсказку
    с новыми личными ссылками-приглашениями на каналы.
 
 Заявки на вступление в группы и каналы бот принимает сам, если там включён автоприём, — от всех, кроме
@@ -55,6 +55,7 @@ CHAT_TTL = 60  # настройки чата (правки из бота сбр�
 ADMINS_TTL = 600
 ADMINS_REFRESH = 60  # перечитать админов чата раньше срока — не чаще (новый админ пишет команду)
 LINKED_TTL = 3600
+POST_TTL = 90 * 24 * 3600  # столько бот помнит пост канала в группе обсуждения: под ним — комментарии
 MENTION_TTL = 24 * 3600
 SUB_YES_TTL = 15 * 60
 SUB_NO_TTL = 15  # короткий: человек подписался — через несколько секунд уже может писать
@@ -151,6 +152,8 @@ class Moderator:
         self._admins = TTLCache(clock)  # {id: ChatMember} админов чата, None — узнать не вышло
         self._admins_fresh = TTLCache(clock)  # чаты, где список админов недавно перечитан
         self._linked = TTLCache(clock)
+        self._posts = TTLCache(clock)  # (чат, id) постов канала в группе обсуждения — корни веток комментариев
+        self._first_seen: dict[int, int] = {}  # чат → id самого раннего нового сообщения, что бот видел
         self._mentions = TTLCache(clock)
         self._subs = TTLCache(clock)
         self._albums = TTLCache(clock)
@@ -210,12 +213,18 @@ class Moderator:
         info = await self.chat_info(message.chat.id)
         if info is None:
             return
+        if not edited:
+            seen = self._first_seen.get(info.tg_id)
+            if seen is None or message.message_id < seen:
+                self._first_seen[info.tg_id] = message.message_id
         if spam.is_join_leave(message):
             # «Бот удалил X» после /ban — служебное сообщение самого бота, убираем всегда
             by_bot = message.from_user is not None and message.from_user.id == self.app.bot_id
             if not edited and (info.rules.enabled("service") or by_bot):
                 await self._delete(info, [message.message_id])
             return
+        if await self._is_comment(info, message):
+            return  # пост канала и комментарии под ним защита не трогает
         if not spam.has_user_content(message) or self._always_allowed(info, message):
             return
 
@@ -258,9 +267,33 @@ class Moderator:
         if reason == "sub" and user is not None and not self._is_backlog(message):
             await self._notice(info, message)
 
-    def _always_allowed(self, info: ChatInfo, message: Message) -> bool:
+    async def _is_comment(self, info: ChatInfo, message: Message) -> bool:
+        """Пост привязанного канала в группе обсуждения или комментарий под ним.
+
+        Ответ в ветке Telegram отмечает message_thread_id (корнем ветки), но так отмечен любой ответ
+        в супергруппе. Ветка комментариев — та, у которой корень — пост канала (автопересылка). Пост бот
+        запоминает, когда видит его или ответ прямо на него (так узнаются и посты, вышедшие до запуска
+        бота). Про ветку, начатую до запуска, бот не знает ничего: в группе обсуждения он считает её
+        комментариями, в обычной группе — нет."""
         if message.is_automatic_forward:
+            self._posts.set((info.tg_id, message.message_id), True, POST_TTL)
             return True
+        reply = message.reply_to_message
+        if reply is not None and reply.is_automatic_forward:  # комментарий прямо к посту
+            self._posts.set((info.tg_id, reply.message_id), True, POST_TTL)
+            return True
+        thread = None if message.is_topic_message else message.message_thread_id
+        if not thread:
+            return False
+        if self._posts.get((info.tg_id, thread)) is not _MISSING:
+            return True  # ответ внутри ветки поста
+        if reply is not None and reply.message_id == thread:
+            return False  # ответ прямо на обычное сообщение
+        if thread >= self._first_seen.get(info.tg_id, thread + 1):
+            return False  # корень ветки бот видел — и это был не пост
+        return await self._linked_chat_id(info) is not None
+
+    def _always_allowed(self, info: ChatInfo, message: Message) -> bool:
         sender = message.sender_chat
         if sender is not None:  # от имени группы (анонимный админ) или канала из скрытых админов
             return sender.id == message.chat.id or info.is_trusted(sender.id, sender.username)
